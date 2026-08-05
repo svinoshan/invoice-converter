@@ -178,3 +178,7 @@ AZURE_DOCUMENT_INTELLIGENCE_KEY="..."
 - Use the **Debug extracted text** expander in the app to see exactly what
   each PDF produced before parsing.
 - On Streamlit Cloud, check **Settings → App logs**.
+- **500 error on Cloud startup** (`GZipResponder.__init__() missing ...
+  'thread_minimum_size'`): a too-new `starlette` breaks Streamlit. The
+  requirements are pinned to the known-good combo (`starlette==1.3.1` with
+  `streamlit==1.61.0`); keep those pins when updating.

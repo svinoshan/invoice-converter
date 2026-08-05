@@ -1,12 +1,16 @@
-streamlit>=1.36
-pandas>=2.0
-openpyxl>=3.1
-pdfplumber>=0.11
-PyMuPDF>=1.24
-pytesseract>=0.3.10
-Pillow>=10.0
-python-dotenv>=1.0
-supabase>=2.6
-python-dateutil>=2.8
-azure-ai-documentintelligence>=1.0.0
-azure-core>=1.30
+# Pinned to versions verified working locally (WSL).
+# starlette is pinned because >=1.4.0 breaks Streamlit 1.61's gzip middleware
+# (GZipResponder requires thread_minimum_size -> 500 errors on Cloud).
+streamlit==1.61.0
+starlette==1.3.1
+pandas==3.0.5
+openpyxl==3.1.5
+pdfplumber==0.11.10
+PyMuPDF==1.28.0
+pytesseract==0.3.13
+Pillow==12.3.0
+python-dotenv==1.2.2
+supabase==2.31.0
+python-dateutil==2.9.0.post0
+azure-ai-documentintelligence==1.0.2
+azure-core==1.41.0
