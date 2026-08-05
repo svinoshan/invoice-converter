@@ -20,10 +20,10 @@ def validate_row(row: Dict) -> List[str]:
     issues: List[str] = []
 
     client = str(row.get("Client") or "").strip()
-    invoice_no = str(row.get("Invo No") or "").strip()
-    invoice_date = str(row.get("Invo Date") or "").strip()
-    description = str(row.get("description") or "").strip()
-    currency = str(row.get("currancy") or "").strip()
+    invoice_no = str(row.get("Invoice No") or "").strip()
+    invoice_date = str(row.get("Invoice Date") or "").strip()
+    description = str(row.get("Description") or "").strip()
+    currency = str(row.get("Currency") or "").strip()
 
     if not client:
         issues.append("Missing client name")
@@ -36,7 +36,7 @@ def validate_row(row: Dict) -> List[str]:
     if not currency:
         issues.append("Missing currency")
 
-    amount_value = row.get("amount")
+    amount_value = row.get("Total amount")
     numeric: Union[float, None] = None
     if isinstance(amount_value, (int, float)) and not isinstance(amount_value, bool):
         numeric = float(amount_value)

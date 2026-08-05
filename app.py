@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 import streamlit as st
 
-from models.schemas import InvoiceLine
+from models.schemas import ParsedInvoice
 from services import (
     excel_exporter,
     invoice_parser,
@@ -242,10 +242,8 @@ def _build_editor_frame() -> pd.DataFrame:
     records: List[Dict] = []
     meta: List[Dict] = []
     for name, parsed in SS.parsed.items():
-        file_records = invoice_parser.flatten_invoice(parsed, file_name=name)
-        records.extend(file_records)
-        count = len(parsed.lines) if parsed.lines else 1
-        meta.extend([{"file": name}] * count)
+        records.append(invoice_parser.invoice_to_row(parsed))
+        meta.append({"file": name})
     SS.row_meta = meta
     if not records:
         return pd.DataFrame(columns=EXPORT_COLUMNS)
@@ -273,8 +271,8 @@ def _render_results() -> Optional[pd.DataFrame]:
         num_rows="dynamic",
         width="stretch",
         column_config={
-            "Invo Date": st.column_config.TextColumn("Invo Date"),
-            "amount": st.column_config.NumberColumn("amount", format="%.2f"),
+            "Invoice Date": st.column_config.TextColumn("Invoice Date"),
+            "Total amount": st.column_config.NumberColumn("Total amount", format="%.2f"),
         },
     )
 
@@ -290,7 +288,7 @@ def _render_results() -> Optional[pd.DataFrame]:
     total_amount = 0.0
     for record in records:
         try:
-            total_amount += float(record.get("amount") or 0)
+            total_amount += float(record.get("Total amount") or 0)
         except (TypeError, ValueError):
             continue
 
@@ -304,7 +302,7 @@ def _render_results() -> Optional[pd.DataFrame]:
         "Needs review",
         sum(1 for status in SS.statuses.values() if status["status"] == "Needs review"),
     )
-    col4.metric("Rows extracted", len(records))
+    col4.metric("Invoices extracted", len(records))
     col5.metric("Total amount", f"{total_amount:,.2f}")
 
     with st.expander("Debug extracted text"):
@@ -320,14 +318,6 @@ def _render_results() -> Optional[pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 
-def _first_nonempty(rows: List[Dict], key: str) -> str:
-    for row in rows:
-        value = str(row.get(key) or "").strip()
-        if value:
-            return value
-    return ""
-
-
 def _align_meta(meta: List[Dict], size: int) -> List[Dict]:
     """Align per-row file metadata with the (possibly edited) table size."""
     aligned = list(meta)
@@ -337,7 +327,7 @@ def _align_meta(meta: List[Dict], size: int) -> List[Dict]:
 
 
 def _run_save(edited: pd.DataFrame) -> None:
-    """Save the edited rows (grouped by invoice) to Supabase."""
+    """Save the edited rows (one invoice per row) to Supabase."""
     if not supabase_service.is_configured():
         st.error(
             "Supabase is not configured. Add SUPABASE_URL and "
@@ -348,32 +338,25 @@ def _run_save(edited: pd.DataFrame) -> None:
     records = edited.to_dict("records")
     meta = _align_meta(SS.row_meta, len(records))
 
-    # Group rows by (invoice number, source file).
-    groups: Dict[tuple, List[int]] = {}
-    for index, (record, item) in enumerate(zip(records, meta)):
-        invoice_no = str(record.get("Invo No") or "").strip()
-        key = (invoice_no, item.get("file", "manual"))
-        groups.setdefault(key, []).append(index)
-
     save_log = SS.save_log
     saved_in_session: set = set()
     uploaded_urls: Dict[str, str] = {}
     summary = {"saved": 0, "duplicates": 0, "skipped": 0, "errors": 0}
 
-    for (invoice_no, file_name), indices in groups.items():
-        rows = [records[i] for i in indices]
+    for index, (record, item) in enumerate(zip(records, meta)):
+        invoice_no = str(record.get("Invoice No") or "").strip()
+        file_name = item.get("file", "manual")
 
         if not invoice_no:
             summary["skipped"] += 1
-            for index in indices:
-                save_log.append(
-                    {
-                        "File": file_name,
-                        "Invo No": "",
-                        "Result": "Skipped",
-                        "Message": f"Row {index + 1}: invoice number is empty",
-                    }
-                )
+            save_log.append(
+                {
+                    "File": file_name,
+                    "Invo No": invoice_no,
+                    "Result": "Skipped",
+                    "Message": f"Row {index + 1}: invoice number is empty",
+                }
+            )
             continue
 
         try:
@@ -417,24 +400,18 @@ def _run_save(edited: pd.DataFrame) -> None:
                     pdf_url = uploaded_urls[file_name]
                 pdf_name = file_name
 
-            lines = [
-                InvoiceLine(
-                    description=str(row.get("description") or ""),
-                    amount=float(row.get("amount") or 0),
-                    currency=str(row.get("currancy") or "").strip(),
-                    line_order=order,
-                )
-                for order, row in enumerate(rows, start=1)
-            ]
-
-            parsed = SS.parsed.get(file_name) if file_name != "manual" else None
-            needs_review = any(validators.validate_row(row) for row in rows)
+            parsed: Optional[ParsedInvoice] = (
+                SS.parsed.get(file_name) if file_name != "manual" else None
+            )
+            needs_review = bool(validators.validate_row(record))
             invoice_id = supabase_service.save_invoice(
                 {
-                    "client_name": _first_nonempty(rows, "Client"),
+                    "client_name": str(record.get("Client") or "").strip(),
                     "invoice_no": invoice_no,
-                    "invoice_date": _first_nonempty(rows, "Invo Date"),
-                    "currency": _first_nonempty(rows, "currancy"),
+                    "invoice_date": str(record.get("Invoice Date") or "").strip(),
+                    "currency": str(record.get("Currency") or "").strip(),
+                    "description_text": str(record.get("Description") or "").strip(),
+                    "total_amount": record.get("Total amount"),
                     "pdf_file_name": pdf_name,
                 },
                 pdf_url=pdf_url,
@@ -442,7 +419,6 @@ def _run_save(edited: pd.DataFrame) -> None:
                 extraction_method=parsed.extraction_method if parsed else "manual",
                 status="needs_review" if needs_review else "saved",
             )
-            supabase_service.save_invoice_lines(invoice_id, lines)
 
             saved_in_session.add(invoice_no)
             summary["saved"] += 1
@@ -451,7 +427,7 @@ def _run_save(edited: pd.DataFrame) -> None:
                     "File": file_name,
                     "Invo No": invoice_no,
                     "Result": "Saved",
-                    "Message": f"{len(lines)} line(s) -> invoice {invoice_id[:8]}",
+                    "Message": f"Invoice saved as {invoice_id[:8]}",
                 }
             )
         except Exception as exc:  # noqa: BLE001 - friendly per-invoice message

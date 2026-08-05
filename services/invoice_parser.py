@@ -1,8 +1,8 @@
-"""Rule-based extraction of invoice metadata and line items from raw text.
+"""Rule-based extraction of invoice metadata, descriptions and total amount.
 
-The parser is intentionally heuristic: invoices vary wildly between suppliers,
-so every extraction is paired with validation warnings in the UI and can be
-manually corrected before saving or exporting.
+The parser returns *invoice-level* data: one :class:`ParsedInvoice` per PDF,
+with all line descriptions kept as a list and the final invoice total amount
+extracted separately (never individual line amounts).
 """
 
 from __future__ import annotations
@@ -352,7 +352,7 @@ def extract_client_name(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Line items
+# Line item descriptions
 # ---------------------------------------------------------------------------
 
 _EXCLUDED_DESC_FRAGMENTS = (
@@ -485,6 +485,176 @@ def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLin
 
 
 # ---------------------------------------------------------------------------
+# Invoice total extraction
+#
+# Layouts vary between suppliers, so we scan every line for a *total-like*
+# label, ignore lines that are clearly subtotals / tax / VAT / exchange-rate
+# rows, then rank the remaining candidates:
+#   - the most explicit label ("grand total" > "invoice total" > "total")
+#   - among equal labels, the LAST occurrence in the document wins, because
+#     the final payable amount usually appears at the bottom of the invoice.
+# ---------------------------------------------------------------------------
+
+_TOTAL_EXCLUDED = (
+    "sub total", "subtotal", "tax amount", "tax", "vat", "excise", "cess",
+    "levy", "exchange rate", "exch rate", "discount", "less:", "advance",
+    "deposit", "paid", "round off", "quantity", "qty",
+)
+
+_TOTAL_PATTERNS = (
+    (re.compile(r"\bgrand\s*total\b"), 10),
+    (re.compile(r"\binvoice\s*total\b"), 9),
+    (re.compile(r"\btotal\s*amount\b"), 9),
+    (re.compile(r"\btotal\s*payable\b"), 9),
+    (re.compile(r"\bamount\s*(?:due|owing|payable)\b"), 9),
+    (re.compile(r"\bbalance\s*due\b"), 8),
+    (re.compile(r"\bnet\s*amount\b"), 8),
+    (re.compile(r"\bbalance\b"), 7),
+    (re.compile(r"\btotal\b"), 5),
+)
+
+_WORD_NUMBERS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100,
+    "thousand": 1000, "million": 1000000,
+}
+
+
+def _parse_small_number(tokens: List[str]) -> int:
+    """Turn a short phrase like 'ninety five' into 95 (used for cents)."""
+    values = [
+        _WORD_NUMBERS[token]
+        for token in tokens
+        if token in _WORD_NUMBERS and _WORD_NUMBERS[token] < 100
+    ]
+    if not values:
+        return 0
+    total = values[0]
+    for value in values[1:]:
+        total += value
+    return total
+
+
+def _words_to_number(text: str) -> Optional[float]:
+    """Convert spelled-out amounts ('One Thousand Three Hundred Forty Five')
+    into a number. Handles a trailing 'x cent(s)' phrase or an 'and NN/100'
+    fraction for the decimals."""
+    words = re.findall(r"[a-z]+", text.lower())
+    if not any(word in _WORD_NUMBERS for word in words):
+        return None
+
+    cents = 0
+    total = 0
+    track = 0
+    found = False
+
+    fraction = re.search(r"\b(?:and\s+)?(\d{1,3})\s*/\s*(\d{1,3})\b", text.lower())
+    if fraction and int(fraction.group(2)) > 0:
+        cents = round(int(fraction.group(1)) * 100 / int(fraction.group(2)))
+        found = True
+
+    for i, word in enumerate(words):
+        if word.startswith("cent"):  # 'cents' marks the decimal phrase
+            cents = _parse_small_number(words[max(0, i - 3):i])
+            continue
+        if word in ("hundred",):
+            track = track * 100 if track else 100
+        elif word in ("thousand", "million"):
+            multiplier = 1000 if word == "thousand" else 1000000
+            track = track * multiplier if track else multiplier
+            total += track
+            track = 0
+        elif word in _WORD_NUMBERS:
+            track += _WORD_NUMBERS[word]
+            found = True
+
+    total += track
+    if not found:
+        return None
+    return round(total + cents / 100, 2)
+
+
+def _extract_numeric_from_line(line: str) -> Optional[float]:
+    """Return the last plausible money amount found on a single line."""
+    amounts = []
+    for token in re.findall(r"-?[\d,]+(?:\.\d{1,2})?", line):
+        value = clean_amount(token)
+        if value is None:
+            continue
+        # Ignore year-like numbers such as '2026'.
+        if value.is_integer() and 1900 <= value <= 2100:
+            continue
+        amounts.append(value)
+    return amounts[-1] if amounts else None
+
+
+def _total_candidate_amount(lines: List[str], index: int) -> Optional[float]:
+    """Find the amount belonging to a total label line.
+
+    Looks at the label line first (numeric, then spelled-out words), then at
+    up to two following lines (some invoices put the number underneath the
+    label, e.g. after a spelled-out 'Total : Euro One Thousand ...').
+    """
+    for offset in range(3):
+        line_index = index + offset
+        if line_index >= len(lines):
+            break
+        # Spelled-out amounts win over stray numbers (e.g. a '50/100' cents
+        # fraction would otherwise be read as 100).
+        amount = _words_to_number(lines[line_index])
+        if amount is not None:
+            return amount
+        amount = _extract_numeric_from_line(lines[line_index])
+        if amount is not None:
+            return amount
+    return None
+
+
+def _total_label_rank(lower_line: str) -> Optional[int]:
+    """Return the priority of the total label found on a line, or None."""
+    for pattern, rank in _TOTAL_PATTERNS:
+        if pattern.search(lower_line):
+            return rank
+    return None
+
+
+def extract_total(text: str) -> Optional[float]:
+    """Return the most likely final invoice payable amount, or ``None``.
+
+    Never returns a subtotal, tax or VAT figure - those lines are excluded
+    before ranking. When several total-like values exist, the value with the
+    most explicit label and the latest position in the document wins.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    candidates: List[tuple] = []
+    for index, line in enumerate(lines):
+        lower = line.lower()
+        if any(keyword in lower for keyword in _TOTAL_EXCLUDED):
+            continue
+        rank = _total_label_rank(lower)
+        if rank is None:
+            continue
+        amount = _total_candidate_amount(lines, index)
+        if amount is not None:
+            candidates.append((rank, index, amount))
+
+    if not candidates:
+        return None
+
+    best_rank = max(candidate[0] for candidate in candidates)
+    best_candidates = [c for c in candidates if c[0] == best_rank]
+    chosen = max(best_candidates, key=lambda c: c[1])
+    return round(chosen[2], 2)
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -495,7 +665,7 @@ def parse_invoice(
     extraction_method: str = "",
     hint: Optional[Dict] = None,
 ) -> ParsedInvoice:
-    """Parse invoice text into a :class:`ParsedInvoice`.
+    """Parse invoice text into an invoice-level :class:`ParsedInvoice`.
 
     ``hint`` is an optional dict (e.g. produced by Azure Document Intelligence)
     whose non-empty values take precedence over the rule-based extraction.
@@ -534,6 +704,23 @@ def parse_invoice(
     else:
         lines = extract_line_items(text, default_currency=currency)
 
+    # Descriptions stay a list internally; only joined with newlines at
+    # display/export time so the user can edit each invoice's cell freely.
+    descriptions = [line.description for line in lines]
+
+    # Total amount priority:
+    #   1. structured hint (Azure prebuilt-invoice "InvoiceTotal")
+    #   2. rule-based total extraction from the raw text
+    #   3. fallback: sum of the parsed line items (warned about below)
+    total_amount = clean_amount(hint.get("total_amount"))
+    total_source = "hint"
+    if total_amount is None:
+        total_amount = extract_total(text)
+        total_source = "extracted"
+    if total_amount is None:
+        total_amount = round(sum(line.amount for line in lines), 2)
+        total_source = "estimated"
+
     warnings: List[str] = []
     if not client_name:
         warnings.append("Missing client name")
@@ -543,14 +730,20 @@ def parse_invoice(
         warnings.append("Missing invoice date")
     if not currency:
         warnings.append("Missing currency")
-    if not lines:
+    if not descriptions:
         warnings.append("No line items detected")
+    if total_amount is None:
+        warnings.append("Missing total amount")
+    elif total_source == "estimated":
+        warnings.append("Invoice total not found; estimated from line items")
 
     return ParsedInvoice(
         client_name=client_name,
         invoice_no=invoice_no,
         invoice_date=invoice_date,
         currency=currency,
+        descriptions=descriptions,
+        total_amount=total_amount,
         lines=lines,
         raw_text=text,
         extraction_method=extraction_method,
@@ -558,34 +751,27 @@ def parse_invoice(
     )
 
 
-EXPORT_COLUMN_KEYS = (
+EXPORT_COLUMNS = (
     "Client",
-    "Invo No",
-    "Invo Date",
-    "description",
-    "amount",
-    "currancy",
+    "Invoice No",
+    "Invoice Date",
+    "Description",
+    "Total amount",
+    "Currency",
 )
 
 
-def _row_from_invoice(invoice: ParsedInvoice, line: InvoiceLine) -> Dict[str, object]:
-    """Flatten one invoice line into an exportable row."""
+def invoice_to_row(invoice: ParsedInvoice) -> Dict[str, object]:
+    """Flatten one parsed invoice into a single exportable row.
+
+    Descriptions are joined with real newlines (Excel renders them on
+    separate lines inside the same cell). The amount is the invoice total.
+    """
     return {
         "Client": invoice.client_name,
-        "Invo No": invoice.invoice_no,
-        "Invo Date": invoice.invoice_date,
-        "description": line.description,
-        "amount": line.amount,
-        "currancy": line.currency or invoice.currency,
+        "Invoice No": invoice.invoice_no,
+        "Invoice Date": invoice.invoice_date,
+        "Description": invoice.description_text,
+        "Total amount": invoice.total_amount if invoice.total_amount is not None else "",
+        "Currency": invoice.currency,
     }
-
-
-def flatten_invoice(invoice: ParsedInvoice, file_name: str = "") -> List[Dict[str, object]]:
-    """Expand a parsed invoice into one row per line item.
-
-    When no line items were found a single placeholder row is returned so the
-    user can still manually fill in the details in the editor.
-    """
-    if invoice.lines:
-        return [_row_from_invoice(invoice, line) for line in invoice.lines]
-    return [_row_from_invoice(invoice, InvoiceLine())]

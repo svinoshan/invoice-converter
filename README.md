@@ -5,10 +5,10 @@ saves them to Supabase (PostgreSQL + Storage) and exports them to Excel.
 
 - Upload one or many invoice PDFs (drag & drop)
 - Automatic text extraction with fallbacks: **pdfplumber → PyMuPDF → Tesseract OCR → Azure Document Intelligence**
-- Rule-based parsing of client name, invoice number, invoice date, currency and line items
+- Rule-based parsing of client name, invoice number, invoice date, currency, line descriptions and the final invoice total
 - Editable results table with validation warnings
 - Duplicate invoice detection by invoice number
-- Save invoices + line items to Supabase, original PDFs to Supabase Storage
+- Save invoices (one row per invoice, with combined descriptions and total) to Supabase, original PDFs to Supabase Storage
 - Clean Excel export via `openpyxl` with a fixed column layout
 
 ## Features
@@ -17,11 +17,11 @@ saves them to Supabase (PostgreSQL + Storage) and exports them to Excel.
 | --- | --- |
 | Upload | Batch PDF upload, drag & drop, per-file status (Pending / Processing / Success / Needs review / Failed) |
 | Extraction | Priority chain with a debug "extracted text" expander per file |
-| Parsing | Client, invoice ref, date, currency normalisation (€/EUR → Euro, $/USD → USD, Rs/LKR → LKR, ...) |
-| Editing | `st.data_editor` with dynamic rows; users fix values before saving/exporting |
+| Parsing | Client, invoice ref, date, currency normalisation (€/EUR → Euro, $/USD → USD, Rs/LKR → LKR, ...), line descriptions, invoice total (`grand total`/`total` labels, spelled-out amounts, Azure `InvoiceTotal`) |
+| Editing | `st.data_editor` with dynamic rows; one row per invoice (descriptions combined with newlines); users fix values before saving/exporting |
 | Validation | Warns on missing client, invoice no, date, currency, amount, description (export is still allowed) |
-| Supabase | `invoices` + `invoice_lines` tables, PDFs in the `invoice-pdfs` bucket, duplicate detection |
-| Excel | Bold header, auto column width, `#,##0.00` amounts, frozen top row |
+| Supabase | `invoices` table, PDFs in the `invoice-pdfs` bucket, duplicate detection |
+| Excel | Bold header, auto column width, wrapped multi-line description cells with grown row heights, `#,##0.00` amounts, frozen top row |
 | Security | Service role key read server-side only, never sent to the browser |
 
 ### Export format
@@ -29,10 +29,14 @@ saves them to Supabase (PostgreSQL + Storage) and exports them to Excel.
 Columns are exactly:
 
 ```
-Client | Invo No | Invo Date | description | amount | currancy
+Client | Invoice No | Invoice Date | Description | Total amount | Currency
 ```
 
-`Invo Date` is normalised to `d-mmm-yy` (e.g. `8-Jun-26`), `amount` to a number.
+`Invoice Date` is normalised to `d-mmm-yy` (e.g. `8-Jun-26`), `Total amount`
+to a number. Each PDF becomes exactly **one row**: the line-item descriptions
+are joined with newlines inside the `Description` cell, and `Total amount` is
+the invoice total (extracted from a `grand total`/`total` label, or estimated
+from the line items when no label exists).
 
 ## Project structure
 
@@ -48,8 +52,8 @@ invoice_converter/
 │   ├── pdf_extractor.py       # pdfplumber -> PyMuPDF -> OCR -> Azure chain
 │   ├── ocr_service.py         # pytesseract on PyMuPDF-rendered pages
 │   ├── azure_invoice_service.py  # optional prebuilt-invoice integration
-│   ├── invoice_parser.py      # rule-based metadata + line item parsing
-│   ├── excel_exporter.py      # openpyxl workbook generation
+│   ├── invoice_parser.py      # rule-based metadata + invoice-level parsing
+│   ├── excel_exporter.py      # openpyxl workbook generation (one row per invoice)
 │   ├── supabase_service.py    # Postgres inserts + storage uploads
 │   └── validators.py          # per-row validation warnings
 ├── utils/
@@ -98,8 +102,8 @@ this section when you want to enable saving.
 
 1. Create a project at https://supabase.com.
 2. **Database schema**: open the **SQL Editor** and run the contents of
-   [`sql/schema.sql`](sql/schema.sql). This creates the `invoices` and
-   `invoice_lines` tables, RLS policies and the `invoice-pdfs` storage bucket.
+   [`sql/schema.sql`](sql/schema.sql). This creates the `invoices` table, RLS
+   policies and the `invoice-pdfs` storage bucket.
    - The bucket can also be created manually in **Storage** (name:
      `invoice-pdfs`, public).
 3. **API keys**: go to **Project Settings → API** and copy:
@@ -148,14 +152,18 @@ AZURE_DOCUMENT_INTELLIGENCE_KEY="..."
 2. **Parsing** (`services/invoice_parser.py`): rule-based extraction of
    client name (labels, company suffixes, position before the invoice ref),
    invoice number (`Invoice ref:`, `Inv No:`, `Ref:`, ...), invoice date
-   (ISO, `dd/mm/yyyy`, `8-Jun-26`), currency (most frequent token) and line
-   items (trailing amount with optional currency token, quantity patterns
-   like `2 x 100.00`, exclusions for subtotal/VAT/total/bank/payment terms).
-3. **Review**: all rows land in an editable table; warnings flag incomplete
-   rows. Nothing is saved or exported without the user's explicit action.
-4. **Save**: PDFs are uploaded to the `invoice-pdfs` bucket, invoices and
-   line items inserted (duplicates by invoice number are skipped with a
-   warning).
+   (ISO, `dd/mm/yyyy`, `8-Jun-26`), currency (most frequent token), line
+   descriptions (trailing amount with optional currency token, quantity
+   patterns like `2 x 100.00`, exclusions for subtotal/VAT/total/bank/payment
+   terms) and the final invoice total (`grand total`/`invoice total`/`total`
+   labels ranked by explicitness, spelled-out amounts, with subtotal/tax/VAT
+   excluded). One `ParsedInvoice` per PDF; descriptions are joined with
+   newlines for the single Excel row.
+3. **Review**: all invoices land in an editable table (one row each); warnings
+   flag incomplete rows. Nothing is saved or exported without the user's
+   explicit action.
+4. **Save**: PDFs are uploaded to the `invoice-pdfs` bucket, invoices
+   inserted (duplicates by invoice number are skipped with a warning).
 5. **Export**: `openpyxl` workbook with the fixed 6-column layout, bold
    headers, frozen first row and number-formatted amounts.
 
@@ -167,8 +175,9 @@ AZURE_DOCUMENT_INTELLIGENCE_KEY="..."
 - Dates like `8/6/26` are interpreted as day-first (common for EU invoices).
 - Files are held in memory while the app runs - for very large batches
   prefer the exported Excel file for storage.
-- The `currancy` column name (spelling) is intentional and matches the
-  required export format.
+- Each PDF becomes one Excel row: if an invoice has no total label, the
+  `Total amount` is estimated from its line items and flagged in the
+  warnings.
 - Excel export and local processing work without any cloud setup; only the
   "Save to Supabase" section requires credentials.
 

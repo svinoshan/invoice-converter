@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from models.schemas import InvoiceLine
+from models.schemas import ParsedInvoice
 from utils.config import (
     ENABLE_SUPABASE_SAVE,
     SUPABASE_BUCKET,
@@ -154,9 +154,9 @@ def save_invoice(
     """Insert one invoice row and return the new row id.
 
     ``invoice_data`` should contain ``client_name``, ``invoice_no``,
-    ``invoice_date`` (canonical ``d-mmm-yy`` string), ``currency`` and
-    ``pdf_file_name``. An unparseable date is stored as NULL rather than
-    failing the insert.
+    ``invoice_date`` (canonical ``d-mmm-yy`` string), ``currency``,
+    ``description_text``, ``total_amount`` and ``pdf_file_name``. An
+    unparseable date is stored as NULL rather than failing the insert.
     """
     invoice_date = invoice_data.get("invoice_date")
     iso_date: Optional[str] = None
@@ -166,11 +166,19 @@ def save_invoice(
         except ValueError:
             iso_date = None
 
+    total_amount = invoice_data.get("total_amount")
+    try:
+        total_amount = round(float(total_amount), 2)
+    except (TypeError, ValueError):
+        total_amount = None
+
     row = {
         "client_name": (invoice_data.get("client_name") or "").strip(),
         "invoice_no": (invoice_data.get("invoice_no") or "").strip(),
         "invoice_date": iso_date,
         "currency": (invoice_data.get("currency") or "").strip(),
+        "description_text": (invoice_data.get("description_text") or "").strip(),
+        "total_amount": total_amount,
         "pdf_file_name": (invoice_data.get("pdf_file_name") or "").strip(),
         "pdf_file_url": pdf_url or "",
         "raw_text": raw_text or "",
@@ -187,22 +195,20 @@ def save_invoice(
     return response.data[0]["id"]
 
 
-def save_invoice_lines(invoice_id: str, lines: List[InvoiceLine]) -> None:
-    """Insert all line items belonging to one invoice."""
-    if not lines:
-        return
-    payload = [
-        {
-            "invoice_id": invoice_id,
-            "description": line.description,
-            "amount": round(float(line.amount), 2),
-            "currency": line.currency,
-            "line_order": line.line_order,
-        }
-        for line in lines
-    ]
-    try:
-        _get_client().table("invoice_lines").insert(payload).execute()
-    except Exception as exc:
-        logger.error("save_invoice_lines failed for invoice %s: %s", invoice_id, exc)
-        raise _friendly_error(exc) from exc
+def save_invoice_from_parsed(invoice: ParsedInvoice, pdf_url: str) -> str:
+    """Insert one parsed invoice row and return the new row id."""
+    return save_invoice(
+        invoice_data={
+            "client_name": invoice.client_name,
+            "invoice_no": invoice.invoice_no,
+            "invoice_date": invoice.invoice_date,
+            "currency": invoice.currency,
+            "description_text": invoice.description_text,
+            "total_amount": invoice.total_amount,
+            "pdf_file_name": "",
+        },
+        pdf_url=pdf_url,
+        raw_text=invoice.raw_text,
+        extraction_method=invoice.extraction_method,
+        status="saved",
+    )

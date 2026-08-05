@@ -34,8 +34,9 @@ def analyze_invoice(file_bytes: bytes) -> Dict[str, Any]:
     """Run Azure prebuilt-invoice analysis over ``file_bytes``.
 
     Returns a dict with keys ``success``, ``error``, ``raw_text``,
-    ``client_name``, ``invoice_no``, ``invoice_date``, ``currency`` and
-    ``lines`` (list of ``{"description", "amount", "currency"}``).
+    ``client_name``, ``invoice_no``, ``invoice_date``, ``currency``,
+    ``total_amount`` and ``lines`` (list of
+    ``{"description", "amount", "currency"}``).
     """
     if not is_configured():
         return {"success": False, "error": "Azure Document Intelligence is not configured"}
@@ -78,6 +79,15 @@ def analyze_invoice(file_bytes: bytes) -> Dict[str, Any]:
             }
         )
 
+    total_field = fields.get("InvoiceTotal") or {}
+    total = total_field.get("valueNumber")
+    if total is None:
+        content = str(total_field.get("content") or "")
+        try:
+            total = float(content.replace(",", "").strip())
+        except (TypeError, ValueError):
+            total = None
+
     return {
         "success": True,
         "raw_text": result.content or "",
@@ -85,5 +95,6 @@ def analyze_invoice(file_bytes: bytes) -> Dict[str, Any]:
         "invoice_no": _safe_content(fields.get("InvoiceId")),
         "invoice_date": _safe_content(fields.get("InvoiceDate")),
         "currency": _safe_content(fields.get("Currency")),
+        "total_amount": total,
         "lines": lines,
     }
