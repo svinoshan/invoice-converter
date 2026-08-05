@@ -416,6 +416,19 @@ def _parse_item_line(line: str, default_currency: str) -> Optional[InvoiceLine]:
         if amount is None:
             continue
 
+        # A bare integer with no decimals is rarely money - it is usually an
+        # area/postal code, index or quantity ("Colombo 08", "page 4"). Only
+        # accept small ones when a currency token sits right next to them.
+        is_bare_integer = "." not in raw_amount and "," not in raw_amount
+        if is_bare_integer and amount < 100:
+            next_to_currency = False
+            if i - 1 >= 0:
+                next_to_currency = bool(normalize_currency(tokens[i - 1]))
+            elif i + 1 < len(tokens):
+                next_to_currency = bool(normalize_currency(tokens[i + 1]))
+            if not next_to_currency:
+                continue
+
         desc_tokens = tokens[:i]
         currency = ""
 
