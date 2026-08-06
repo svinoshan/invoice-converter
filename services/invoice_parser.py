@@ -442,6 +442,17 @@ def _is_region_stop_line(line: str) -> bool:
     return any(fragment in lower for fragment in _ITEM_REGION_STOP_FRAGMENTS)
 
 
+def _looks_like_item_text(line: str) -> bool:
+    """True when a non-parseable table line is probably a wrapped continuation
+    of the next item's description (e.g. a long item split over two lines)."""
+    stripped = line.strip(" -•*()[]:.,;\"'")
+    if len(stripped) < 3:
+        return False
+    if not re.search(r"[A-Za-z]{2,}", stripped):
+        return False
+    return not stripped.lower().startswith(_SKIP_DESC_PREFIXES)
+
+
 def _parse_item_line(
     line: str, default_currency: str, table_mode: bool = False
 ) -> Optional[InvoiceLine]:
@@ -507,7 +518,7 @@ def _parse_item_line(
             amount = round(amount * quantity, 2)
             desc_tokens = desc_tokens[:-2]
 
-        description = " ".join(desc_tokens).strip(" -•*()[]:.,;\"'")
+        description = " ".join(desc_tokens).strip(" -•*:.,;\"'")
         if not description or len(description) < 3:
             return None
         if not re.search(r"[A-Za-z]", description):
@@ -543,6 +554,7 @@ def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLin
 
     items: List[InvoiceLine] = []
     order = 0
+    pending: List[str] = []
     for index, raw_line in enumerate(lines):
         if index < region_start:
             continue
@@ -550,7 +562,12 @@ def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLin
             break
         item = _parse_item_line(raw_line, default_currency, table_mode=table_mode)
         if item is None:
+            if table_mode and _looks_like_item_text(raw_line):
+                pending.append(raw_line.strip())
             continue
+        if pending:
+            item.description = " ".join(pending) + " " + item.description
+            pending = []
         order += 1
         item.line_order = order
         items.append(item)

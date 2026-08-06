@@ -225,6 +225,57 @@ def _yvonnie_address_block():
 check("parser: supplier address block never leaks into items", _yvonnie_address_block)
 
 
+_TROPICAL_WRAPPED_TEXT = (
+    "SUSPENDED TAX INVOICE\n"
+    "Tropical Health Food (Pvt) Ltd. Invoice ref: LKA/CUC/SVAT/2020/12/0642\n"
+    "Heraliyawela Industrial Park Project_ref: PRJ 004161\n"
+    "Malkaduwawa , Kurunegala Date: 18-12-2020\n"
+    "SRI LANKA\n"
+    "0094-37-2224308\n"
+    "info@thf.lk\n"
+    "VAT Registration no.. 114128007-7000\n"
+    "SVAT Registration no.. SVAT004620\n"
+    "Description Quantity Rate Total :\n"
+    "Inspection & Certification Fee for EEC for 2020 : 3 Days @ Euro 500/Day (Offer\n"
+    "Ref. No : : CUSL-ORG-2020-190-APR 147667)(Additional Day) 3 500 1,500.00\n"
+    "EUR one thousand five hundred only Total : EUR 1,500.00\n"
+    "The LKR value of the SVAT amount is 26905.20 SVAT @ 8.00% 120.00\n"
+    "Exchange Rate: 1 EUR = 224.2100 LKR\n"
+    "Total value of the supply with SVAT EUR 1,620.00\n"
+    "Payment Terms:\n"
+    "All bank charges are on Account of the Customer\n"
+    "Kindly include the invoice number in the Telegraphic Transfer Instructions\n"
+    "The Gross Invoice value is payable within 14days from the date of invoice\n"
+    "Payment Instructions-\n"
+    "Commercial Bank Of Ceylon PLC\n"
+    "Reid Avenue Branch Control Union Inspections (Pvt) Ltd\n"
+    "ADD: No.104, Reid Avenue,\n"
+    "Colombo 04.\n"
+    "A/C No: 8010003245 Account type:FEEA (EUR) SAVINGS\n"
+    "Swift/Bic No. CCEYLKLX\n"
+    "SVAT No. :SVAT004104 Authorised Signatory\n"
+    "VAT No. :114462322-7000\n"
+    "Page: 1 of 1\n"
+)
+
+
+def _tropical_wrapped_line():
+    descs = invoice_parser.extract_descriptions(_TROPICAL_WRAPPED_TEXT)
+    assert len(descs) == 1, descs
+    assert descs[0] == (
+        "Inspection & Certification Fee for EEC for 2020 : 3 Days @ "
+        "Euro 500/Day (Offer Ref. No : : CUSL-ORG-2020-190-APR 147667)"
+        "(Additional Day)"
+    ), descs[0]
+    parsed = invoice_parser.parse_invoice(_TROPICAL_WRAPPED_TEXT)
+    assert parsed.total_amount == 1620.0, parsed.total_amount
+    assert parsed.client == "Tropical Health Food (Pvt) Ltd."
+    assert parsed.invoice_date == "18-Dec-20", parsed.invoice_date
+
+
+check("parser: wrapped item description joins continuation lines", _tropical_wrapped_line)
+
+
 def _sub_total():
     assert invoice_parser.extract_sub_total(_SAMPLE_TEXT) == 1345.2
     assert invoice_parser.extract_sub_total("No labels here") is None
