@@ -67,7 +67,11 @@ def _render_upload() -> None:
     )
     if uploaded is not None:
         new_files = [{"name": item.name, "data": item.getvalue()} for item in uploaded]
-        if [f["name"] for f in new_files] != [f["name"] for f in SS.files]:
+        # Only a *non-empty* selection that differs replaces the current batch.
+        # Navigating to another page prunes the uploader's widget state, so on
+        # return the widget is empty even though the batch is still loaded -
+        # that must not wipe SS.files/preview.
+        if new_files and [f["name"] for f in new_files] != [f["name"] for f in SS.files]:
             SS.files = new_files
             SS.statuses = {}
             SS.preview = []
