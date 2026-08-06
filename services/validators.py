@@ -62,8 +62,8 @@ def validate_row(row: Dict) -> List[str]:
 
     subtotal = _to_float(row.get("Sub total"))
     if subtotal is not None and math.isnan(subtotal):
-        issues.append("Sub total is not numeric")
-    elif subtotal is None:
+        subtotal = None
+    if subtotal is None:
         issues.append("Sub total is missing (optional)")
 
     total = _to_float(row.get("Total amount"))

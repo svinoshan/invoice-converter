@@ -181,6 +181,50 @@ def _descriptions():
 check("parser: extract_descriptions excludes summary rows", _descriptions)
 
 
+_YVONNE_SVAT_TEXT = (
+    "SUSPENDED TAX INVOICE\n"
+    "Yvonne Lanka (Pvt) Ltd Invoice ref: LKA/CUC/SVAT/2020/09/0402\n"
+    "Nurani Industrial Park, Waikkala Project_ref: PRJ 866806\n"
+    "Postal code: 61170 Date: 30-09-2020\n"
+    "Wennappuwa\n"
+    "SRI LANKA\n"
+    "(+94) 71 425 2038,\n"
+    "piyalns.lk@yvonnegroup.com\n"
+    "VAT Registration no.. 100895579-7000\n"
+    "SVAT Registration no.. 11584\n"
+    "Description Quantity Rate Total :\n"
+    "Invoice for Higg FEM Verification 1 600 600.00\n"
+    "USD six hundred only Total : USD 600.00\n"
+    "The LKR value of the SVAT amount is 8709.12 SVAT @ 8.00% 48.00\n"
+    "Exchange Rate: 1 USD = 181.4400 LKR\n"
+    "Total value of the supply with SVAT USD 648.00\n"
+    "Payment Terms:\n"
+    "60 days from the date of invoice.\n"
+    "Bank Details:\n"
+    "Commercial Bank Of Ceylon PLC\n"
+    "A/C No: 8010003244\n"
+    "Swift/Bic No. CCEYLKLX\n"
+    "Reid Avenue Branch\n"
+    "ADD: No.104, Reid Avenue, Colombo 04.\n"
+)
+
+
+def _yvonnie_address_block():
+    items = invoice_parser.extract_line_items(_YVONNE_SVAT_TEXT)
+    assert [i.description for i in items] == ["Invoice for Higg FEM Verification"], items
+    assert items[0].amount == 600.0
+    descs = invoice_parser.extract_descriptions(_YVONNE_SVAT_TEXT)
+    assert descs == ["Invoice for Higg FEM Verification"], descs
+    parsed = invoice_parser.parse_invoice(_YVONNE_SVAT_TEXT)
+    assert parsed.invoice_date == "30-Sep-20", parsed.invoice_date
+    assert parsed.invoice_no == "LKA/CUC/SVAT/2020/09/0402"
+    assert parsed.client == "Yvonne Lanka (Pvt) Ltd"
+    assert parsed.total_amount == 648.0, parsed.total_amount
+
+
+check("parser: supplier address block never leaks into items", _yvonnie_address_block)
+
+
 def _sub_total():
     assert invoice_parser.extract_sub_total(_SAMPLE_TEXT) == 1345.2
     assert invoice_parser.extract_sub_total("No labels here") is None

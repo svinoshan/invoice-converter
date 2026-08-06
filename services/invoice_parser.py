@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from dateutil import parser as date_parser
 
@@ -365,6 +365,7 @@ _EXCLUDED_DESC_FRAGMENTS = (
     "credited to our", "kindly credit", "cheque", "cheque no", "all remittances",
     "please transfer", "for the payment", "we request", "in settlement",
     "thank you", "yours faithfully", "yours sincerely", "best regards",
+    "postal code", "project_ref", "project ref",
 )
 
 _HEADER_ONLY_DESC = {
@@ -376,10 +377,12 @@ _HEADER_ONLY_DESC = {
 }
 
 _SKIP_DESC_PREFIXES = (
-    "invoice", "ref:", "page", "tel:", "phone:", "fax:", "email:", "e-mail:",
-    "www", "http", "bank:", "swift", "vat", "a/c", "date :", "date:",
-    "dated", "total", "sub total", "currency", "bill to", "ship to", "client",
-    "customer", "attn", "balance", "no.", "no:", "no ",
+    "invoice no", "invoice number", "invoice #", "invoice ref",
+    "invoice date", "invoice dated", "ref:", "page", "tel:", "phone:",
+    "fax:", "email:", "e-mail:", "www", "http", "bank:", "swift", "vat",
+    "a/c", "date :", "date:", "dated", "total", "sub total", "currency",
+    "bill to", "ship to", "client", "customer", "attn", "balance", "no.",
+    "no:", "no ",
 )
 
 
@@ -401,7 +404,47 @@ def _is_amount_token(token: str) -> bool:
     return True
 
 
-def _parse_item_line(line: str, default_currency: str) -> Optional[InvoiceLine]:
+_ITEM_TABLE_HEADER_RE = re.compile(
+    r"\b(?:description|particulars)\b.*\b(?:qty|quantity|unit)\b.*"
+    r"\b(?:rate|price|amount|total|value)\b",
+    re.IGNORECASE,
+)
+_ITEM_TABLE_HEADER_SIMPLE_RE = re.compile(
+    r"\b(?:description|particulars|item)\b.*\b(?:amount|total|value|rate|price)\b",
+    re.IGNORECASE,
+)
+_ITEM_REGION_STOP_FRAGMENTS = (
+    "sub total", "subtotal", "grand total", "total amount", "total due",
+    "total", "svat", "vat", "tax", "exchange", "payment", "terms", "bank",
+    "swift", "signatory", "page", "discount", "advance", "deposit", "road",
+    "street", "avenue", "lane", "colombo", "address", "add :", "add:",
+    "telephone", "phone", "email", "www", "fax",
+)
+
+
+def _find_item_region(lines: Sequence[str]) -> int:
+    """Return the index of the first line that may hold line items.
+
+    When a line-item table header (e.g. "Description Quantity Rate Total")
+    is found, only the lines *after* it are parsed as items - supplier
+    address/reference blocks printed above the table can never leak into
+    the line items. Returns 0 when no header is found (free-form layout).
+    """
+    for index, line in enumerate(lines):
+        lower = line.lower()
+        if _ITEM_TABLE_HEADER_RE.search(lower) or _ITEM_TABLE_HEADER_SIMPLE_RE.search(lower):
+            return index + 1
+    return 0
+
+
+def _is_region_stop_line(line: str) -> bool:
+    lower = line.lower()
+    return any(fragment in lower for fragment in _ITEM_REGION_STOP_FRAGMENTS)
+
+
+def _parse_item_line(
+    line: str, default_currency: str, table_mode: bool = False
+) -> Optional[InvoiceLine]:
     """Try to interpret one text line as ``description <amount> [currency]``."""
     stripped = line.strip()
     if not stripped or len(stripped) < 4:
@@ -417,16 +460,17 @@ def _parse_item_line(line: str, default_currency: str) -> Optional[InvoiceLine]:
             continue
 
         # A bare integer with no decimals is rarely money - it is usually an
-        # area/postal code, index or quantity ("Colombo 08", "page 4"). Only
-        # accept small ones when a currency token sits right next to them.
+        # area/postal code, index or quantity ("Colombo 08", "page 4",
+        # "Project_ref: PRJ 866806"). Only accept it when a currency token
+        # sits right next to it, it is a small number, or we are inside a
+        # recognised item table where the last column is the amount.
         is_bare_integer = "." not in raw_amount and "," not in raw_amount
-        if is_bare_integer and amount < 100:
-            next_to_currency = False
-            if i - 1 >= 0:
-                next_to_currency = bool(normalize_currency(tokens[i - 1]))
-            elif i + 1 < len(tokens):
-                next_to_currency = bool(normalize_currency(tokens[i + 1]))
-            if not next_to_currency:
+        if is_bare_integer:
+            next_to_currency = bool(
+                (i - 1 >= 0 and normalize_currency(tokens[i - 1]))
+                or (i + 1 < len(tokens) and normalize_currency(tokens[i + 1]))
+            )
+            if not next_to_currency and (not table_mode or amount < 100):
                 continue
 
         desc_tokens = tokens[:i]
@@ -484,11 +528,27 @@ def _parse_item_line(line: str, default_currency: str) -> Optional[InvoiceLine]:
 
 
 def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLine]:
-    """Parse all plausible line items out of ``text`` in order."""
+    """Parse plausible line items out of ``text`` in order.
+
+    When a line-item table header is found, only the region after it is
+    scanned, up to the first totals / payment / address line - so supplier
+    address blocks above the table or bank details below it never produce
+    fake items. Without a header the whole text is scanned (free-form
+    layout), where trailing bare integers of 100 or more are rejected as
+    amounts (they are usually postal codes, project refs or phone numbers).
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    region_start = _find_item_region(lines)
+    table_mode = region_start > 0
+
     items: List[InvoiceLine] = []
     order = 0
-    for raw_line in text.splitlines():
-        item = _parse_item_line(raw_line.strip(), default_currency)
+    for index, raw_line in enumerate(lines):
+        if index < region_start:
+            continue
+        if table_mode and _is_region_stop_line(raw_line):
+            break
+        item = _parse_item_line(raw_line, default_currency, table_mode=table_mode)
         if item is None:
             continue
         order += 1
@@ -535,6 +595,15 @@ _TOTAL_PATTERNS = (
     (re.compile(r"\bnet\s*amount\b"), 8),
     (re.compile(r"\bbalance\b"), 7),
     (re.compile(r"\btotal\b"), 5),
+)
+
+# On SVAT / suspended-tax invoices the final payable is the supply value
+# *plus* the SVAT, i.e. "Total value of the supply with SVAT". Plain "Total"
+# lines on such invoices are usually just the line-item subtotal written out
+# in words, so this label must outrank them.
+_TOTAL_SVAT_RE = re.compile(
+    r"\btotal\s+value\s+of\s+the\s+supply\b",
+    re.IGNORECASE,
 )
 
 # Labels that identify the *subtotal before VAT/tax*. The final payable total
@@ -707,7 +776,9 @@ def extract_total_amount(text: str) -> Optional[float]:
 
     Never returns a subtotal, tax or VAT figure - those lines are excluded
     before ranking. When several total-like values exist, the value with the
-    most explicit label and the latest position in the document wins.
+    most explicit label and the latest position in the document wins. On
+    SVAT / suspended-tax invoices the "Total value of the supply with SVAT"
+    line is the final payable and outranks plain "Total" lines.
     """
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not lines:
@@ -716,11 +787,14 @@ def extract_total_amount(text: str) -> Optional[float]:
     candidates: List[tuple] = []
     for index, line in enumerate(lines):
         lower = line.lower()
-        if any(keyword in lower for keyword in _TOTAL_EXCLUDED):
+        is_svat_total = bool(_TOTAL_SVAT_RE.search(lower))
+        if not is_svat_total and any(keyword in lower for keyword in _TOTAL_EXCLUDED):
             continue
         rank = _total_label_rank(lower)
         if rank is None:
             continue
+        if is_svat_total:
+            rank = max(rank, 11)
         amount = _total_candidate_amount(lines, index)
         if amount is not None:
             candidates.append((rank, index, amount))

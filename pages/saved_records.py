@@ -150,13 +150,34 @@ def render() -> None:
 
     validation = validators.validate_rows(records)
     if validation:
-        st.warning(
-            f"{len(validation)} row(s) have issues - check the values below. "
-            "Only a missing invoice number or total amount blocks saving; "
-            "other issues (e.g. a missing invoice date) are advisory."
+        blocking = sum(
+            1
+            for item in validation
+            if any(
+                issue.startswith(("Missing invoice number", "Total amount"))
+                for issue in item["issues"]
+            )
         )
-        for item in validation[:25]:
-            st.markdown(f"- **Row {item['row']}**: {', '.join(item['issues'])}")
+        st.warning(
+            f"{len(validation)} row(s) have issues "
+            f"({blocking} block saving). View the details below. Only a "
+            "missing invoice number or total amount blocks saving; other "
+            "issues (e.g. a missing invoice date) are advisory."
+        )
+        with st.expander("View issue details"):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Row": item["row"],
+                            "Issues": ", ".join(item["issues"]),
+                        }
+                        for item in validation
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
 
     if export_clicked:
         st.download_button(
