@@ -1,0 +1,129 @@
+"""AppTest verification for the 4-page Streamlit app.
+
+Run from the project root:
+
+    .venv/bin/python tests/apptest_pages.py
+
+Verifies that every page runs without exceptions, the export section shows
+exactly one download button per flow, and the Dashboard shows the count
+metrics + per-currency chart/table (with a seeded Supabase client).
+"""
+
+from __future__ import annotations
+
+import sys
+
+ROOT = "/home/svinoshan/projects/invoice/invoice_converter"
+sys.path.insert(0, ROOT)
+
+from streamlit.testing.v1 import AppTest  # noqa: E402
+
+fails = []
+
+
+def run(page, label):
+    try:
+        at = AppTest.from_file(f"{ROOT}/app.py", default_timeout=20)
+        at.run()
+        if at.exception:
+            fails.append(f"{label}: app.py {[str(e) for e in at.exception]}")
+            return
+        at.switch_page(page)
+        at.run()
+        if at.exception:
+            fails.append(f"{label}: {[str(e) for e in at.exception]}")
+            return
+        print(f"ok  {label}")
+    except Exception as exc:  # noqa: BLE001
+        fails.append(f"{label}: {exc}")
+
+
+run("pages/dashboard.py", "dashboard")
+run("pages/upload_process.py", "upload_process")
+run("pages/saved_records.py", "saved_records")
+run("pages/settings.py", "settings")
+
+# Export section: exactly one download button per flow on the upload page.
+at = AppTest.from_file(f"{ROOT}/app.py", default_timeout=20)
+at.run()
+at.switch_page("pages/upload_process.py")
+at.run()
+downloads = [b.label for b in at.get("download_button")]
+print("download buttons:", downloads)
+assert "Export all records to Excel" in downloads, downloads
+assert "Export current extracted rows to Excel (preview)" in downloads, downloads
+assert downloads.count("Export all records to Excel") == 1, downloads
+assert downloads.count("Export current extracted rows to Excel (preview)") == 1, downloads
+
+# Dashboard: count metrics only, no legacy summed-currency cards.
+at.switch_page("pages/dashboard.py")
+at.run()
+metrics = [m.label for m in at.metric]
+print("metrics:", metrics)
+for label in ("Total saved records", "Needs review", "Reviewed", "PDFs processed"):
+    assert label in metrics, metrics
+assert "Sum of Sub total" not in metrics and "Sum of Total amount" not in metrics, metrics
+
+# Seed Supabase so the per-currency chart/table render.
+from services import supabase_service  # noqa: E402
+from utils import ui_helpers  # noqa: E402
+
+
+class _FakeClient:
+    def __init__(self):
+        self.state = {
+            "fake_data": [
+                {"client": "M", "invoice_no": "I-1", "invoice_date": "2026-06-08",
+                 "description": "d", "sub_total": 1345.2, "total_amount": 1345.2,
+                 "currency": "Euro", "extraction_status": "processed",
+                 "reviewed": True, "source_file_name": "a.pdf"},
+                {"client": "B", "invoice_no": "I-2", "invoice_date": "2026-06-09",
+                 "description": "d2", "sub_total": 53.1, "total_amount": 53.1,
+                 "currency": "USD", "extraction_status": "needs_review",
+                 "reviewed": False, "source_file_name": "b.pdf"},
+            ]
+        }
+
+    def table(self, name):
+        assert name == "invoice_records", name
+        return _FakeTable(self.state)
+
+
+class _FakeTable:
+    def __init__(self, state):
+        self.state = state
+
+    def select(self, *args, **kwargs):
+        return _FakeQuery(self.state).select(*args, **kwargs)
+
+
+class _FakeQuery:
+    def __init__(self, state):
+        self.state = state
+
+    def select(self, *args, **kwargs):
+        return self
+
+    def eq(self, *a): return self
+    def ilike(self, *a): return self
+    def order(self, *a, **k): return self
+    def limit(self, *a): return self
+
+    def execute(self):
+        return type("R", (), {"data": self.state["fake_data"], "count": None})()
+
+
+ui_helpers.cached_summary.clear()
+ui_helpers.cached_export_bytes_from_db.clear()
+supabase_service._client = _FakeClient()  # noqa: SLF001
+supabase_service.is_enabled = lambda: True
+supabase_service.is_configured = lambda: True
+at.run()
+assert not at.exception, [str(e) for e in at.exception]
+assert (
+    at.get("bar_chart") or at.get("arrow_vega_lite_chart") or at.get("vega_lite_chart")
+), "no bar chart"
+assert at.dataframe, "no currency table"
+
+print("FAILS:", fails) if fails else print("all apptest checks passed")
+sys.exit(1 if fails else 0)

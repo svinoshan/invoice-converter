@@ -1,8 +1,18 @@
-"""Supabase PostgreSQL + Storage integration.
+"""Supabase PostgreSQL integration: the source of truth for invoice records.
 
-Uses the service role key server-side only. The service role key is never
-exposed to the browser; it is read from Streamlit secrets or environment
-variables.
+Extracted invoices are upserted into the ``invoice_records`` table using
+``invoice_no`` as the unique conflict key, so re-processing a PDF updates the
+existing row instead of duplicating it. The table (see ``sql/schema.sql``) is:
+
+    client, invoice_no (unique, not null), invoice_date, description,
+    sub_total, total_amount, currency, source_file_name, raw_text,
+    extraction_status, reviewed, created_at, updated_at
+
+Uploaded PDF files are intentionally NOT stored - only the extracted records.
+Excel exports are generated from these records, never from session state.
+
+Uses the service role key server-side only; it is never exposed to the
+browser and is read from Streamlit secrets or environment variables.
 """
 
 from __future__ import annotations
@@ -11,17 +21,12 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from models.schemas import ParsedInvoice
-from utils.config import (
-    ENABLE_SUPABASE_SAVE,
-    SUPABASE_BUCKET,
-    SUPABASE_SERVICE_ROLE_KEY,
-    SUPABASE_URL,
-)
-from utils.file_utils import unique_filename
+from utils.config import ENABLE_SUPABASE_SAVE, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from utils.logging_config import get_logger
 
 logger = get_logger("supabase_service")
+
+_INVOICE_RECORDS_TABLE = "invoice_records"
 
 
 class SupabaseNotConfiguredError(RuntimeError):
@@ -82,133 +87,238 @@ def _get_client() -> Any:
     return _client
 
 
-def upload_pdf_to_storage(
-    file_name: str, file_bytes: bytes, bucket: Optional[str] = None
-) -> str:
-    """Upload ``file_bytes`` to the storage bucket and return its public URL."""
-    client = _get_client()
-    bucket = bucket or SUPABASE_BUCKET or "invoice-pdfs"
-    storage_path = f"uploads/{unique_filename(file_name)}"
+# ---------------------------------------------------------------------------
+# Record normalisation
+# ---------------------------------------------------------------------------
 
+
+def _to_iso_date(value: object) -> Optional[str]:
+    """Convert the canonical ``d-mmm-yy`` string to ISO (for a date column)."""
+    if not value:
+        return None
     try:
-        client.storage.from_(bucket).upload(
-            storage_path,
-            file_bytes,
-            file_options={"content-type": "application/pdf", "cache-control": "3600"},
-        )
-    except TypeError:
-        # Older supabase-py versions accept options positionally.
-        client.storage.from_(bucket).upload(
-            storage_path, file_bytes, {"content-type": "application/pdf"}
-        )
+        return datetime.strptime(str(value).strip(), "%d-%b-%y").date().isoformat()
+    except ValueError:
+        return None
+
+
+def _to_optional_float(value: object) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return round(float(value), 2)
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return round(float(text.replace(",", "")), 2)
+    except ValueError:
+        return None
+
+
+def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a record (clean field names) to the database row payload.
+
+    ``reviewed``, ``raw_text`` and ``source_file_name`` are included only
+    when the caller actually provides them (non-empty), so automatic or
+    partial upserts never overwrite the stored metadata - e.g. saving a
+    Reviewed checkbox on the Saved Records page must not wipe the original
+    extraction text or source PDF name.
+    """
+    payload = {
+        "client": (record.get("client") or "").strip(),
+        "invoice_no": (record.get("invoice_no") or "").strip(),
+        "invoice_date": _to_iso_date(record.get("invoice_date")),
+        "description": (record.get("description") or "").strip(),
+        "sub_total": _to_optional_float(record.get("sub_total")),
+        "total_amount": _to_optional_float(record.get("total_amount")),
+        "currency": (record.get("currency") or "").strip(),
+        "extraction_status": (record.get("extraction_status") or "processed").strip(),
+        "updated_at": "now",
+    }
+    if record.get("reviewed") is not None:
+        payload["reviewed"] = bool(record.get("reviewed"))
+    if record.get("raw_text"):
+        payload["raw_text"] = (record.get("raw_text") or "").strip()
+    if record.get("source_file_name"):
+        payload["source_file_name"] = (record.get("source_file_name") or "").strip()
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Upsert / read / query
+# ---------------------------------------------------------------------------
+
+
+def upsert_invoice_records(records: List[Dict[str, Any]]) -> int:
+    """Upsert several invoices on ``invoice_no``; return the number upserted.
+
+    Records without an ``invoice_no`` are skipped so a missing number never
+    creates a broken or duplicate row.
+    """
+    payload = [_normalize_record(r) for r in records if (r.get("invoice_no") or "").strip()]
+    if not payload:
+        return 0
+    try:
+        _get_client().table(_INVOICE_RECORDS_TABLE).upsert(
+            payload, on_conflict="invoice_no"
+        ).execute()
     except Exception as exc:
-        logger.error("Storage upload failed for %s: %s", file_name, exc)
-        raise RuntimeError(f"Could not upload PDF to storage: {exc}") from exc
+        logger.error("upsert_invoice_records failed: %s", exc)
+        raise _friendly_error(exc) from exc
+    return len(payload)
 
-    return f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{bucket}/{storage_path}"
+
+def upsert_invoice_record(record: Dict[str, Any]) -> int:
+    """Upsert a single invoice on ``invoice_no``; return 1 when written."""
+    return upsert_invoice_records([record])
 
 
-def check_duplicate_invoice(invoice_no: str) -> bool:
-    """Return True when an invoice with this number already exists."""
+def check_invoice_exists(invoice_no: str) -> bool:
+    """Return True when an invoice with this number is already stored."""
+    invoice_no = (invoice_no or "").strip()
     if not invoice_no:
         return False
     try:
         response = (
             _get_client()
-            .table("invoices")
-            .select("id")
+            .table(_INVOICE_RECORDS_TABLE)
+            .select("invoice_no")
             .eq("invoice_no", invoice_no)
             .maybe_single()
             .execute()
         )
         return response.data is not None
     except Exception as exc:
-        logger.warning("Duplicate check failed for %s: %s", invoice_no, exc)
+        logger.warning("check_invoice_exists failed for %s: %s", invoice_no, exc)
         return False
 
 
-def get_existing_invoices(limit: int = 200) -> List[str]:
-    """Return the most recent invoice numbers stored in the database."""
+def update_reviewed_status(invoice_no: str, reviewed: bool) -> bool:
+    """Set the ``reviewed`` flag for a single invoice number."""
     try:
         response = (
             _get_client()
-            .table("invoices")
-            .select("invoice_no")
-            .order("created_at", desc=True)
-            .limit(limit)
+            .table(_INVOICE_RECORDS_TABLE)
+            .update({"reviewed": bool(reviewed), "updated_at": "now"})
+            .eq("invoice_no", (invoice_no or "").strip())
             .execute()
         )
-        return [row["invoice_no"] for row in (response.data or [])]
+        return bool(response.data)
     except Exception as exc:
-        logger.error("get_existing_invoices failed: %s - %s", _friendly_error(exc), exc)
+        logger.error("update_reviewed_status failed for %s: %s", invoice_no, exc)
+        raise _friendly_error(exc) from exc
+
+
+def get_all_invoice_records(
+    limit: int = 2000, order: str = "invoice_date"
+) -> List[Dict[str, Any]]:
+    """Return stored invoice records (newest invoice dates first)."""
+    return get_invoice_records(limit=limit, order=order)
+
+
+def get_invoice_records(
+    limit: int = 2000,
+    order: str = "invoice_date",
+    status: Optional[str] = None,
+    reviewed: Optional[bool] = None,
+    client: str = "",
+    invoice_no: str = "",
+    invoice_date: str = "",
+) -> List[Dict[str, Any]]:
+    """Return stored invoice records with optional filters applied."""
+    try:
+        query = _get_client().table(_INVOICE_RECORDS_TABLE).select("*")
+        if status:
+            query = query.eq("extraction_status", status)
+        if reviewed is not None:
+            query = query.eq("reviewed", reviewed)
+        if client:
+            query = query.ilike("client", f"%{client}%")
+        if invoice_no:
+            query = query.ilike("invoice_no", f"%{invoice_no}%")
+        if invoice_date:
+            iso = _to_iso_date(invoice_date)
+            if iso:
+                query = query.eq("invoice_date", iso)
+        response = query.order(order, desc=True).limit(limit).execute()
+        return list(response.data or [])
+    except Exception as exc:
+        logger.error("get_invoice_records failed: %s - %s", _friendly_error(exc), exc)
         return []
 
 
-def save_invoice(
-    invoice_data: Dict[str, Any],
-    pdf_url: str,
-    raw_text: str,
-    extraction_method: str,
-    status: str,
-) -> str:
-    """Insert one invoice row and return the new row id.
+def get_invoice_records_by_status(status: str) -> List[Dict[str, Any]]:
+    """Return stored records filtered by ``extraction_status``."""
+    return get_invoice_records(status=(status or "").strip() or None)
 
-    ``invoice_data`` should contain ``client_name``, ``invoice_no``,
-    ``invoice_date`` (canonical ``d-mmm-yy`` string), ``currency``,
-    ``description_text``, ``total_amount`` and ``pdf_file_name``. An
-    unparseable date is stored as NULL rather than failing the insert.
-    """
-    invoice_date = invoice_data.get("invoice_date")
-    iso_date: Optional[str] = None
-    if invoice_date:
-        try:
-            iso_date = datetime.strptime(str(invoice_date), "%d-%b-%y").date().isoformat()
-        except ValueError:
-            iso_date = None
 
-    total_amount = invoice_data.get("total_amount")
+def get_invoice_record_count() -> int:
+    """Return the total number of stored invoice records."""
     try:
-        total_amount = round(float(total_amount), 2)
-    except (TypeError, ValueError):
-        total_amount = None
-
-    row = {
-        "client_name": (invoice_data.get("client_name") or "").strip(),
-        "invoice_no": (invoice_data.get("invoice_no") or "").strip(),
-        "invoice_date": iso_date,
-        "currency": (invoice_data.get("currency") or "").strip(),
-        "description_text": (invoice_data.get("description_text") or "").strip(),
-        "total_amount": total_amount,
-        "pdf_file_name": (invoice_data.get("pdf_file_name") or "").strip(),
-        "pdf_file_url": pdf_url or "",
-        "raw_text": raw_text or "",
-        "extraction_method": extraction_method or "",
-        "status": status or "saved",
-    }
-
-    try:
-        response = _get_client().table("invoices").insert(row).execute()
+        response = (
+            _get_client()
+            .table(_INVOICE_RECORDS_TABLE)
+            .select("id", count="exact")
+            .limit(0)
+            .execute()
+        )
+        if response.count is not None:
+            return int(response.count)
+        return 0
     except Exception as exc:
-        logger.error("save_invoice failed: %s", exc)
-        raise _friendly_error(exc) from exc
-
-    return response.data[0]["id"]
+        logger.error("get_invoice_record_count failed: %s - %s", _friendly_error(exc), exc)
+        return 0
 
 
-def save_invoice_from_parsed(invoice: ParsedInvoice, pdf_url: str) -> str:
-    """Insert one parsed invoice row and return the new row id."""
-    return save_invoice(
-        invoice_data={
-            "client_name": invoice.client_name,
-            "invoice_no": invoice.invoice_no,
-            "invoice_date": invoice.invoice_date,
-            "currency": invoice.currency,
-            "description_text": invoice.description_text,
-            "total_amount": invoice.total_amount,
-            "pdf_file_name": "",
-        },
-        pdf_url=pdf_url,
-        raw_text=invoice.raw_text,
-        extraction_method=invoice.extraction_method,
-        status="saved",
-    )
+def get_invoice_summary_totals() -> Dict[str, Any]:
+    """Return lightweight Dashboard aggregates for the stored records.
+
+    Only the aggregation-relevant columns are fetched - never the raw_text
+    blobs. Supabase Edge/REST does not expose aggregates without SQL RPCs,
+    so counts and per-currency totals are computed in Python.
+
+    Returns:
+        count: total records
+        needs_review: records needing validation review
+        reviewed: records manually verified by a human
+        source_files: distinct source PDF names
+        by_currency: [{currency, count, total_amount}] sorted by total desc
+    """
+    try:
+        response = (
+            _get_client()
+            .table(_INVOICE_RECORDS_TABLE)
+            .select("sub_total, total_amount, currency, extraction_status, reviewed, source_file_name")
+            .limit(10000)
+            .execute()
+        )
+        records = list(response.data or [])
+    except Exception as exc:
+        logger.error("get_invoice_summary_totals failed: %s", exc)
+        return {
+            "count": 0,
+            "needs_review": 0,
+            "reviewed": 0,
+            "source_files": 0,
+            "by_currency": [],
+        }
+    per_currency: Dict[str, Dict[str, Any]] = {}
+    for rec in records:
+        currency = (rec.get("currency") or "Unknown").strip() or "Unknown"
+        bucket = per_currency.setdefault(currency, {"count": 0, "total_amount": 0.0})
+        bucket["count"] += 1
+        bucket["total_amount"] += float(rec.get("total_amount") or 0)
+    by_currency = [
+        {"currency": cur, "count": b["count"], "total_amount": round(b["total_amount"], 2)}
+        for cur, b in sorted(
+            per_currency.items(), key=lambda item: item[1]["total_amount"], reverse=True
+        )
+    ]
+    return {
+        "count": len(records),
+        "needs_review": sum(
+            1 for r in records if (r.get("extraction_status") or "") == "needs_review"
+        ),
+        "reviewed": sum(1 for r in records if r.get("reviewed")),
+        "source_files": len({r.get("source_file_name") for r in records if r.get("source_file_name")}),
+        "by_currency": by_currency,
+    }

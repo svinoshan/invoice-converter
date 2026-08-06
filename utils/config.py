@@ -33,7 +33,14 @@ def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 SUPABASE_URL: Optional[str] = _get_secret("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY: Optional[str] = _get_secret("SUPABASE_SERVICE_ROLE_KEY")
+
+# The secret key used for server-side access. Supabase is phasing out the
+# legacy JWT-based `service_role` key (deprecated by end of 2026) in favour
+# of the opaque Secret key `sb_secret_...`. Accept either the new
+# SUPABASE_SECRET_KEY or the legacy SUPABASE_SERVICE_ROLE_KEY name.
+SUPABASE_SERVICE_ROLE_KEY: Optional[str] = _get_secret(
+    "SUPABASE_SECRET_KEY"
+) or _get_secret("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_BUCKET: str = _get_secret("SUPABASE_BUCKET", "invoice-pdfs") or "invoice-pdfs"
 
 # Master switch for the "Save to Supabase" feature. Keep it false (default)

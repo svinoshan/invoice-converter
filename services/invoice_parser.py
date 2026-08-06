@@ -497,6 +497,17 @@ def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLin
     return items
 
 
+def extract_descriptions(text: str, default_currency: str = "") -> List[str]:
+    """Return the invoice charge descriptions only, in document order.
+
+    Financial summary rows (Sub Total, VAT, Total, exchange rate, bank and
+    payment terms) are already excluded by the line-item parser, so only the
+    actual charge descriptions remain - e.g. ``["TC Charges ... 01/02/2026",
+    "COI Charges ... 01/02/2026"]``.
+    """
+    return [item.description for item in extract_line_items(text, default_currency)]
+
+
 # ---------------------------------------------------------------------------
 # Invoice total extraction
 #
@@ -524,6 +535,23 @@ _TOTAL_PATTERNS = (
     (re.compile(r"\bnet\s*amount\b"), 8),
     (re.compile(r"\bbalance\b"), 7),
     (re.compile(r"\btotal\b"), 5),
+)
+
+# Labels that identify the *subtotal before VAT/tax*. The final payable total
+# ("grand total", "invoice total", plain "total") must never be used here.
+_SUBTOTAL_EXCLUDED = (
+    "grand total", "invoice total", "total amount", "total payable",
+    "amount due", "amount owing", "balance due", "vat", "tax amount", "tax",
+    "excise", "cess", "exchange rate", "exch rate", "payment terms",
+    "payment instructions", "amount in words", "words", "less: advance",
+    "less advance", "advance paid", "deposit paid",
+)
+
+_SUBTOTAL_PATTERNS = (
+    (re.compile(r"\bsub\s*[- ]?total\b"), 10),  # Sub Total / Subtotal / Sub-total
+    (re.compile(r"\bnet\s*total\b"), 8),
+    (re.compile(r"\bnet\s*amount\b"), 8),
+    (re.compile(r"\btotal\s*before\s*(?:tax|vat)\b"), 7),
 )
 
 _WORD_NUMBERS = {
@@ -635,7 +663,46 @@ def _total_label_rank(lower_line: str) -> Optional[int]:
     return None
 
 
-def extract_total(text: str) -> Optional[float]:
+def _subtotal_label_rank(lower_line: str) -> Optional[int]:
+    """Return the priority of the subtotal label found on a line, or None."""
+    for pattern, rank in _SUBTOTAL_PATTERNS:
+        if pattern.search(lower_line):
+            return rank
+    return None
+
+
+def extract_sub_total(text: str) -> Optional[float]:
+    """Return the invoice subtotal (value before VAT/tax), or ``None``.
+
+    Looks for labels such as ``Sub Total``/``Subtotal``/``Net Amount`` and
+    never returns a VAT/tax figure, the grand/final total or an exchange rate.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    candidates: List[tuple] = []
+    for index, line in enumerate(lines):
+        lower = line.lower()
+        if any(keyword in lower for keyword in _SUBTOTAL_EXCLUDED):
+            continue
+        rank = _subtotal_label_rank(lower)
+        if rank is None:
+            continue
+        amount = _total_candidate_amount(lines, index)
+        if amount is not None:
+            candidates.append((rank, index, amount))
+
+    if not candidates:
+        return None
+
+    best_rank = max(candidate[0] for candidate in candidates)
+    best_candidates = [c for c in candidates if c[0] == best_rank]
+    chosen = max(best_candidates, key=lambda c: c[1])
+    return round(chosen[2], 2)
+
+
+def extract_total_amount(text: str) -> Optional[float]:
     """Return the most likely final invoice payable amount, or ``None``.
 
     Never returns a subtotal, tax or VAT figure - those lines are excluded
@@ -667,6 +734,10 @@ def extract_total(text: str) -> Optional[float]:
     return round(chosen[2], 2)
 
 
+# Backwards-compatible alias used by earlier tests/callers.
+extract_total = extract_total_amount
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -682,14 +753,20 @@ def parse_invoice(
 
     ``hint`` is an optional dict (e.g. produced by Azure Document Intelligence)
     whose non-empty values take precedence over the rule-based extraction.
+
+    ``sub_total`` and ``total_amount`` are never taken from individual line
+    item amounts - they come from the structured hint or the explicit
+    Sub-total / Total labels in the document, or are left ``None`` so the
+    record is flagged for review.
     """
     hint = hint or {}
 
     invoice_no = (
         str(hint.get("invoice_no") or "").strip() or extract_invoice_number(text)
     )
-    client_name = (
-        str(hint.get("client_name") or "").strip() or extract_client_name(text)
+    client = (
+        str(hint.get("client") or hint.get("client_name") or "").strip()
+        or extract_client_name(text)
     )
     invoice_date = normalize_date(hint.get("invoice_date")) or extract_invoice_date(
         text
@@ -721,21 +798,22 @@ def parse_invoice(
     # display/export time so the user can edit each invoice's cell freely.
     descriptions = [line.description for line in lines]
 
-    # Total amount priority:
-    #   1. structured hint (Azure prebuilt-invoice "InvoiceTotal")
-    #   2. rule-based total extraction from the raw text
-    #   3. fallback: sum of the parsed line items (warned about below)
-    total_amount = clean_amount(hint.get("total_amount"))
-    total_source = "hint"
-    if total_amount is None:
-        total_amount = extract_total(text)
-        total_source = "extracted"
-    if total_amount is None:
-        total_amount = round(sum(line.amount for line in lines), 2)
-        total_source = "estimated"
+    # Sub total priority: 1. structured hint, 2. explicit Sub Total label.
+    # Use "is not None": a genuine 0.0 (credit note / zero-rated row) is a
+    # valid amount and must not be treated as falsy.
+    hint_sub_total = clean_amount(hint.get("sub_total"))
+    sub_total = hint_sub_total if hint_sub_total is not None else extract_sub_total(text)
+
+    # Total amount priority: 1. structured hint, 2. explicit total label.
+    # Never fall back to summing line items - that could produce a value that
+    # ignores VAT and would be silently wrong.
+    hint_total = clean_amount(hint.get("total_amount"))
+    total_amount = (
+        hint_total if hint_total is not None else extract_total_amount(text)
+    )
 
     warnings: List[str] = []
-    if not client_name:
+    if not client:
         warnings.append("Missing client name")
     if not invoice_no:
         warnings.append("Missing invoice number")
@@ -744,22 +822,26 @@ def parse_invoice(
     if not currency:
         warnings.append("Missing currency")
     if not descriptions:
-        warnings.append("No line items detected")
+        warnings.append("No line item descriptions detected")
+    if sub_total is None:
+        warnings.append("Sub total not found")
     if total_amount is None:
         warnings.append("Missing total amount")
-    elif total_source == "estimated":
-        warnings.append("Invoice total not found; estimated from line items")
+
+    extraction_status = "processed" if total_amount is not None else "needs_review"
 
     return ParsedInvoice(
-        client_name=client_name,
+        client=client,
         invoice_no=invoice_no,
         invoice_date=invoice_date,
         currency=currency,
         descriptions=descriptions,
+        sub_total=sub_total,
         total_amount=total_amount,
-        lines=lines,
+        source_file_name=file_name,
         raw_text=text,
         extraction_method=extraction_method,
+        extraction_status=extraction_status,
         warnings=warnings,
     )
 
@@ -769,22 +851,24 @@ EXPORT_COLUMNS = (
     "Invoice No",
     "Invoice Date",
     "Description",
+    "Sub total",
     "Total amount",
     "Currency",
 )
 
 
 def invoice_to_row(invoice: ParsedInvoice) -> Dict[str, object]:
-    """Flatten one parsed invoice into a single exportable row.
+    """Flatten one parsed invoice into a single exportable/editable row.
 
     Descriptions are joined with real newlines (Excel renders them on
-    separate lines inside the same cell). The amount is the invoice total.
+    separate lines inside the same cell). One row per invoice.
     """
     return {
-        "Client": invoice.client_name,
+        "Client": invoice.client,
         "Invoice No": invoice.invoice_no,
         "Invoice Date": invoice.invoice_date,
-        "Description": invoice.description_text,
+        "Description": invoice.description,
+        "Sub total": invoice.sub_total if invoice.sub_total is not None else "",
         "Total amount": invoice.total_amount if invoice.total_amount is not None else "",
         "Currency": invoice.currency,
     }

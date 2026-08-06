@@ -5,7 +5,7 @@ newline-separated descriptions, so wrap text is enabled and row heights grow
 with the number of lines.
 
 Export layout (exact headers):
-``Client, Invoice No, Invoice Date, Description, Total amount, Currency``
+``Client, Invoice No, Invoice Date, Description, Sub total, Total amount, Currency``
 """
 
 from __future__ import annotations
@@ -23,12 +23,13 @@ EXPORT_COLUMNS = [
     "Invoice No",
     "Invoice Date",
     "Description",
+    "Sub total",
     "Total amount",
     "Currency",
 ]
 
 _DESCRIPTION_COLUMN = "Description"
-_AMOUNT_COLUMN = "Total amount"
+_AMOUNT_COLUMNS = {"Sub total", "Total amount"}
 _BASE_ROW_HEIGHT = 20  # points, default
 _LINE_HEIGHT = 15.0  # approx points per text line in a wrapped cell
 _MAX_ROW_HEIGHT = 300.0
@@ -37,7 +38,7 @@ _MAX_COLUMN_WIDTH = 60
 
 def _to_excel_value(column: str, value: object) -> object:
     """Coerce a record value into something openpyxl can write safely."""
-    if column == _AMOUNT_COLUMN:
+    if column in _AMOUNT_COLUMNS:
         if value is None or value == "":
             return None
         try:
@@ -74,7 +75,7 @@ def _build_workbook(rows: List[Dict]) -> Workbook:
                 column=col_idx,
                 value=_to_excel_value(title, record.get(title)),
             )
-            if title == _AMOUNT_COLUMN:
+            if title in _AMOUNT_COLUMNS:
                 cell.number_format = "#,##0.00"
             if title == _DESCRIPTION_COLUMN:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)

@@ -1,65 +1,89 @@
 # Invoice PDF to Excel Converter
 
-A production-ready Streamlit MVP that turns invoice PDFs into editable rows,
-saves them to Supabase (PostgreSQL + Storage) and exports them to Excel.
+A Streamlit app that turns invoice PDFs into structured invoice records,
+stores them in **Supabase as the source of truth** and exports them to Excel.
 
-- Upload one or many invoice PDFs (drag & drop)
+- Batch upload and processing — large uploads are split internally into safe chunks automatically (no manual batch size)
+- Four-page Streamlit UI (sidebar navigation): **Dashboard** (summary cards only), **Upload & Process** (the full workflow: upload → process → review & edit → save → export), **Saved Records** (filters + inline edit + export) and **Settings** (processing options, session controls, debug info)
 - Automatic text extraction with fallbacks: **pdfplumber → PyMuPDF → Tesseract OCR → Azure Document Intelligence**
-- Rule-based parsing of client name, invoice number, invoice date, currency, line descriptions and the final invoice total
-- Editable results table with validation warnings
-- Duplicate invoice detection by invoice number
-- Save invoices (one row per invoice, with combined descriptions and total) to Supabase, original PDFs to Supabase Storage
-- Clean Excel export via `openpyxl` with a fixed column layout
+- Rule-based parsing of client, invoice number, date, descriptions, **Sub total** and **Total amount**
+- One Excel row per invoice (descriptions combined with newlines in one cell)
+- **Upsert** to Supabase keyed on `invoice_no` — no duplicates, existing records updated
+- Excel is generated from **Supabase records** (all or filtered), never from session state
+- Uploaded PDF files are intentionally **not stored** anywhere
 
 ## Features
 
 | Area | Details |
 | --- | --- |
-| Upload | Batch PDF upload, drag & drop, per-file status (Pending / Processing / Success / Needs review / Failed) |
-| Extraction | Priority chain with a debug "extracted text" expander per file |
-| Parsing | Client, invoice ref, date, currency normalisation (€/EUR → Euro, $/USD → USD, Rs/LKR → LKR, ...), line descriptions, invoice total (`grand total`/`total` labels, spelled-out amounts, Azure `InvoiceTotal`) |
-| Editing | `st.data_editor` with dynamic rows; one row per invoice (descriptions combined with newlines); users fix values before saving/exporting |
-| Validation | Warns on missing client, invoice no, date, currency, amount, description (export is still allowed) |
-| Supabase | `invoices` table, PDFs in the `invoice-pdfs` bucket, duplicate detection |
-| Excel | Bold header, auto column width, wrapped multi-line description cells with grown row heights, `#,##0.00` amounts, frozen top row |
-| Security | Service role key read server-side only, never sent to the browser |
+| Pages | Sidebar navigation: Dashboard, Upload & Process, Saved Records, Settings (no separate Review & Edit page — the review table and its Save button live on Upload & Process, right after processing) |
+| Upload | On Upload & Process section 1: batch PDF upload, drag & drop, "View uploaded files" expander with count and total size |
+| Batch processing | Section 2: "Process PDFs" button; batch size is chosen automatically (`≤20 files` → all, average `≤1MB` → 50, `≤5MB` → 25, otherwise 10); valid records upserted immediately; per-file details in "View processing details" expander |
+| Parsing | Client, invoice number, date, currency normalisation, line descriptions, **Sub total** (from `Sub Total`/`Subtotal`/`Net Amount` labels) and **Total amount** (from `Total`/`Grand Total`/`Amount Due` labels, never a line-item sum, VAT or subtotal) |
+| Editing | Section 3 on Upload & Process: `st.data_editor` with dynamic rows (not hidden in an expander); one row per invoice; users fix values before saving with "Save edited records" directly under the table |
+| Validation | Client, Invoice No, Invoice Date, Description, Total amount and Currency required; Sub total numeric if present; missing Invoice No / Total amount → `needs_review` |
+| Supabase | `invoice_records` table, upsert on `invoice_no`, records survive app refresh |
+| Excel | Section 4 on Upload & Process: "Export all saved records to Excel" (from Supabase) plus a clearly-labelled "Export current extracted rows to Excel (preview)"; Saved Records page adds "Export current filtered records to Excel". Bold blue-header row with white font, frozen top row, wrapped multi-line Description cells with grown row heights, `#,##0.00` numeric Sub total / Total amount |
+| Security | Secret key (`sb_secret_...`) read server-side only, never sent to the browser |
 
 ### Export format
 
-Columns are exactly:
+Columns are exactly, in this order:
 
 ```
-Client | Invoice No | Invoice Date | Description | Total amount | Currency
+Client | Invoice No | Invoice Date | Description | Sub total | Total amount | Currency
 ```
 
-`Invoice Date` is normalised to `d-mmm-yy` (e.g. `8-Jun-26`), `Total amount`
-to a number. Each PDF becomes exactly **one row**: the line-item descriptions
-are joined with newlines inside the `Description` cell, and `Total amount` is
-the invoice total (extracted from a `grand total`/`total` label, or estimated
-from the line items when no label exists).
+- `Invoice Date` is normalised to `d-mmm-yy` (e.g. `8-Jun-26`).
+- `Description` holds all charge descriptions joined with newlines.
+- `Sub total` is the amount **before** VAT/tax, `Total amount` the final payable.
+
+Example:
+
+```
+Client:      Metshu Exports (Pvt) Ltd
+Invoice No:  LKA/CUC/2026/06/1030
+Invoice Date: 8-Jun-26
+Description:  Import Certificate Charges - 01/02/2026-30/04/2026
+              TC Charges - 01/02/2026-30/04/2026
+              COI Charges - 01/02/2026-30/04/2026
+              GBCOI Charges - 01/02/2026-30/04/2026
+Sub total:    1140.00
+Total amount: 1345.20
+Currency:     Euro
+```
+
+(Here VAT of 205.20 is ignored for both Sub total and Total amount.)
 
 ## Project structure
 
 ```
 invoice_converter/
-├── app.py                     # Streamlit UI (thin, orchestration only)
+├── app.py                     # Streamlit entry: st.navigation + page wiring
+├── pages/
+│   ├── dashboard.py           # summary cards + system status only
+│   ├── upload_process.py      # the full workflow (sections 1-4)
+│   ├── saved_records.py       # load/filter/edit/export persisted records
+│   └── settings.py            # OCR/Azure toggles, session, debug info
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
 ├── models/
-│   └── schemas.py             # InvoiceLine, ParsedInvoice dataclasses
+│   └── schemas.py             # ParsedInvoice dataclass (one per invoice)
 ├── services/
 │   ├── pdf_extractor.py       # pdfplumber -> PyMuPDF -> OCR -> Azure chain
 │   ├── ocr_service.py         # pytesseract on PyMuPDF-rendered pages
 │   ├── azure_invoice_service.py  # optional prebuilt-invoice integration
-│   ├── invoice_parser.py      # rule-based metadata + invoice-level parsing
-│   ├── excel_exporter.py      # openpyxl workbook generation (one row per invoice)
-│   ├── supabase_service.py    # Postgres inserts + storage uploads
-│   └── validators.py          # per-row validation warnings
+│   ├── invoice_parser.py      # rule-based invoice-level parsing
+│   ├── processing.py          # auto batch chunking + processing + upsert
+│   ├── excel_exporter.py      # openpyxl workbook generation
+│   ├── supabase_service.py    # upsert / query of invoice_records
+│   └── validators.py          # per-record validation + review flags
 ├── utils/
 │   ├── config.py              # secrets from Streamlit secrets / .env
 │   ├── logging_config.py
-│   └── file_utils.py
+│   ├── file_utils.py
+│   └── ui_helpers.py          # session state, summary cache, record <-> row
 └── sql/
     └── schema.sql             # run once in the Supabase SQL editor
 ```
@@ -91,101 +115,105 @@ Open http://localhost:8501.
 
 | Component | Config | Notes |
 | --- | --- | --- |
-| Supabase (required for saving) | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_BUCKET` | Without these the app still processes and exports Excel |
-| Azure Document Intelligence (optional) | `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`, `AZURE_DOCUMENT_INTELLIGENCE_KEY` | Used as an enhanced fallback for scanned PDFs |
+| Supabase (recommended) | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` (or legacy `SUPABASE_SERVICE_ROLE_KEY`) | Without it the app still parses and previews records, but Excel export (from stored records) and saving are unavailable |
+| Azure Document Intelligence (optional) | `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT`, `AZURE_DOCUMENT_INTELLIGENCE_KEY` | Enhanced fallback for scanned PDFs |
 
 ## Supabase setup
 
 Skipping Supabase for now? Just leave `ENABLE_SUPABASE_SAVE=false` (the
-default) — the app works fully as a local PDF → Excel converter. Come back to
-this section when you want to enable saving.
+default). Set it to `true` and add the credentials below to enable saving,
+loading and Excel export from stored records.
 
 1. Create a project at https://supabase.com.
 2. **Database schema**: open the **SQL Editor** and run the contents of
-   [`sql/schema.sql`](sql/schema.sql). This creates the `invoices` table, RLS
-   policies and the `invoice-pdfs` storage bucket.
-   - The bucket can also be created manually in **Storage** (name:
-     `invoice-pdfs`, public).
-3. **API keys**: go to **Project Settings → API** and copy:
+   [`sql/schema.sql`](sql/schema.sql). This creates the `invoice_records`
+   table (with the `invoice_no` uniqueness constraint used by upsert), the
+   `updated_at` trigger, RLS policies and indexes.
+   - The file also includes the idempotent `ALTER TABLE ... ADD COLUMN IF NOT
+     EXISTS` migration for tables created by an older version, and the legacy
+     `amount` / `currancy` columns (if any) are left untouched and ignored.
+3. **API keys**: go to **Project Settings → API** (or **Settings → API Keys**) and copy:
    - `Project URL` → `SUPABASE_URL`
-   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY` (keep it server-side only!)
+   - The server-side **Secret key** (`sb_secret_...`, under **Secret keys**) →
+     `SUPABASE_SECRET_KEY` (or the legacy `service_role` JWT under **Legacy API
+     Keys** → `SUPABASE_SERVICE_ROLE_KEY`). The app accepts either name; the
+     legacy `service_role` key is deprecated by Supabase at the end of 2026.
+   - Do not use `SUPABASE_JWKS_URL` - it is only for verifying user session
+     JWTs, not a database credential.
 
-## Deployment to Streamlit Community Cloud
+Uploaded PDF files are **not** stored — only the extracted records, so no
+storage bucket is needed.
 
-1. Push the project to a GitHub repository (do **not** commit `.env` or
-   `secrets.toml`).
-2. Go to https://share.streamlit.io → **Create app** → select the repository,
-   branch, main file `invoice_converter/app.py`... or simpler: add a
-   `streamlit_app.py`/use the repo root. If you keep the folder layout above,
-   set the main file to `invoice_converter/app.py`.
-3. Under **Advanced settings → Secrets**, paste:
+## Typical workflow (700 invoices)
 
-```toml
-SUPABASE_URL="https://xxxx.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY="eyJ..."
-SUPABASE_BUCKET="invoice-pdfs"
-
-AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT="https://xxxx.cognitiveservices.azure.com/"
-AZURE_DOCUMENT_INTELLIGENCE_KEY="..."
-```
-
-   (The Azure block is optional.)
-4. Deploy. `requirements.txt` is picked up automatically.
+1. **Upload & Process → 1. Upload PDFs**: choose invoice PDFs (20–50 at a
+   time is fine; the app handles more in one go too).
+2. **2. Process PDFs**: press **Process PDFs**. Valid records are parsed and
+   upserted immediately (auto chunking if the upload is large); incomplete
+   records stay in the preview below marked "Needs review".
+3. **3. Review & edit extracted rows**: correct the rows in the `data_editor`,
+   then press **Save edited records** directly under the table — the upsert
+   never duplicates an `invoice_no`.
+4. Repeat uploads / processing across multiple sessions; records persist in
+   Supabase. Use **Clear session data** in Settings when starting fresh.
+5. **4. Export to Excel**: export all saved records (from Supabase) or the
+   current extracted rows as a labelled preview.
+6. **Saved Records** page: load records with filters (status, reviewed,
+   client, invoice number, date range), inline-edit and save changes back,
+   or export the filtered set to Excel.
 
 ## Environment variables
 
 | Variable | Required | Description |
 | --- | --- | --- |
-| `ENABLE_SUPABASE_SAVE` | optional | Master switch for saving to Supabase. Default `false` (app runs purely as a local PDF → Excel converter). Set to `true` plus the credentials below to enable saving |
+| `ENABLE_SUPABASE_SAVE` | optional | Master switch for Supabase saving. Default `false`. Set to `true` plus the credentials below to enable saving/loading/export |
 | `SUPABASE_URL` | for saving | Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` | for saving | Service role key (server-side only) |
-| `SUPABASE_BUCKET` | optional | Storage bucket name, default `invoice-pdfs` |
+| `SUPABASE_SECRET_KEY` | for saving | Server-side Secret key (`sb_secret_...`, Settings → API Keys → Secret keys). Preferred over the legacy key |
+| `SUPABASE_SERVICE_ROLE_KEY` | for saving | Legacy `service_role` JWT (Settings → API Keys → Legacy API Keys). Still accepted as a fallback, deprecated by Supabase end of 2026 |
 | `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` | optional | Azure Form/Document Intelligence endpoint |
 | `AZURE_DOCUMENT_INTELLIGENCE_KEY` | optional | Azure API key |
 
 ## How it works
 
 1. **Extraction chain** (`services/pdf_extractor.py`): tries pdfplumber first;
-   if the text is empty or shorter than 40 characters it falls back to
-   PyMuPDF, then Tesseract OCR (pages rasterised at 200 DPI), then Azure
-   Document Intelligence (when enabled and configured).
-2. **Parsing** (`services/invoice_parser.py`): rule-based extraction of
-   client name (labels, company suffixes, position before the invoice ref),
-   invoice number (`Invoice ref:`, `Inv No:`, `Ref:`, ...), invoice date
-   (ISO, `dd/mm/yyyy`, `8-Jun-26`), currency (most frequent token), line
-   descriptions (trailing amount with optional currency token, quantity
-   patterns like `2 x 100.00`, exclusions for subtotal/VAT/total/bank/payment
-   terms) and the final invoice total (`grand total`/`invoice total`/`total`
-   labels ranked by explicitness, spelled-out amounts, with subtotal/tax/VAT
-   excluded). One `ParsedInvoice` per PDF; descriptions are joined with
-   newlines for the single Excel row.
-3. **Review**: all invoices land in an editable table (one row each); warnings
-   flag incomplete rows. Nothing is saved or exported without the user's
-   explicit action.
-4. **Save**: PDFs are uploaded to the `invoice-pdfs` bucket, invoices
-   inserted (duplicates by invoice number are skipped with a warning).
-5. **Export**: `openpyxl` workbook with the fixed 6-column layout, bold
-   headers, frozen first row and number-formatted amounts.
+   falls back to PyMuPDF, then Tesseract OCR (pages rasterised at 200 DPI),
+   then Azure Document Intelligence.
+2. **Parsing** (`services/invoice_parser.py`): one `ParsedInvoice` per PDF.
+   - `extract_descriptions` returns only the charge descriptions (summary /
+     bank / footer lines excluded).
+   - `extract_sub_total` looks for `Sub Total` / `Subtotal` / `Net Amount`
+     labels and ignores VAT, tax and the grand total.
+   - `extract_total_amount` looks for `Total` / `Grand Total` / `Amount Due` /
+     `Balance Due` labels and picks the final payable amount — never a line
+     item, the subtotal or VAT.
+3. **Upsert**: after processing, valid records are upserted on `invoice_no`;
+   incomplete records (e.g. missing total) stay in the preview flagged
+   `needs_review` until manually corrected and saved. The `reviewed` flag is
+   human-only: it is never set by processing, only by ticking the **Reviewed**
+   checkbox on the Saved Records page, and re-processing a PDF preserves an
+   existing `reviewed` value.
+4. **Load**: the Saved Records page loads any subset of the stored records
+   (filters on status, reviewed, client, invoice number, date range).
+5. **Export**: Excel is generated from the Supabase records via `openpyxl` —
+   one row per invoice, bold header, frozen first row, wrapped Description
+   cells with row heights grown to fit, numeric `#,##0.00` Sub total and
+   Total amount. The "Export current extracted rows to Excel (preview)"
+   button is the only export that uses session rows instead of stored records.
 
-## Known limitations
+## Notes on legacy columns
 
-- Parsing is heuristic: unusually formatted invoices may need manual
-  corrections in the editor before saving/exporting.
-- OCR accuracy depends on the local `tesseract` install and PDF scan quality.
-- Dates like `8/6/26` are interpreted as day-first (common for EU invoices).
-- Files are held in memory while the app runs - for very large batches
-  prefer the exported Excel file for storage.
-- Each PDF becomes one Excel row: if an invoice has no total label, the
-  `Total amount` is estimated from its line items and flagged in the
-  warnings.
-- Excel export and local processing work without any cloud setup; only the
-  "Save to Supabase" section requires credentials.
+If an earlier version of the schema stored `amount` and `currancy` columns,
+they are kept untouched. Internally the app uses the clean field names
+`client`, `invoice_no`, `invoice_date`, `description`, `sub_total`,
+`total_amount`, `currency` and exports the final headers `Client`, `Invoice
+No`, `Invoice Date`, `Description`, `Sub total`, `Total amount`, `Currency`
+— never `Invo No` / `Invo Date` / `amount` / `currancy`.
 
 ## Debugging
 
 - Logs are written to stdout by `utils/logging_config.py`.
-- Use the **Debug extracted text** expander in the app to see exactly what
-  each PDF produced before parsing.
+- Use the **View processing details** expander (section 2) to see the
+  extraction method and a per-file status/message for each PDF.
 - On Streamlit Cloud, check **Settings → App logs**.
 - **500 error on Cloud startup** (`GZipResponder.__init__() missing ...
   'thread_minimum_size'`): a too-new `starlette` breaks Streamlit. The
