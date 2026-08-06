@@ -34,10 +34,10 @@ ui_helpers.init_state()
 # "/upload_process", etc.
 pg = st.navigation(
     [
-        st.Page("pages/dashboard.py", title="Dashboard", icon="📊", default=True),
-        st.Page("pages/upload_process.py", title="Upload & Process", icon="📤"),
-        st.Page("pages/saved_records.py", title="Saved Records", icon="🗄️"),
-        st.Page("pages/settings.py", title="Settings", icon="⚙️"),
+        st.Page("pages/dashboard.py", title="Dashboard", default=True),
+        st.Page("pages/upload_process.py", title="Upload & Process"),
+        st.Page("pages/saved_records.py", title="Saved Records"),
+        st.Page("pages/settings.py", title="Settings"),
     ],
     position="sidebar",
 )

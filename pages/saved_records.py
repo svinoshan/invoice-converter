@@ -38,6 +38,10 @@ def _apply_date_range(records: List[Dict], start, end) -> List[Dict]:
     return filtered
 
 
+def _mark_edited() -> None:
+    st.session_state.saved_edits = True
+
+
 def render() -> None:
     ui_helpers.init_state()
     SS = st.session_state
@@ -69,8 +73,29 @@ def render() -> None:
         "Invoice date to", value=None, key="sr_date_to"
     )
 
-    load_col, info_col = st.columns([1, 3])
-    if load_col.button("Load saved records", type="primary"):
+    # Pending = any unsaved edit in the table below (same pattern as the
+    # Upload & Process "Save changes" button). Records loaded here are already
+    # persisted, so the button stays disabled until something is edited.
+    # .get() keeps this safe even if a hot-reloaded server still runs an older
+    # ui_helpers that has not initialized the flag yet.
+    pending = bool(SS.get("saved_edits", False))
+
+    header_left, header_right = st.columns([2, 1], vertical_alignment="center")
+    with header_left:
+        load_clicked = st.button("Load saved records", type="primary")
+    with header_right:
+        col_e, col_s = st.columns(2, vertical_alignment="center", gap="small")
+        with col_e:
+            export_clicked = st.button("Export to Excel", width="stretch")
+        with col_s:
+            save_clicked = st.button(
+                "Save changes",
+                type="primary",
+                width="stretch",
+                disabled=not pending,
+            )
+
+    if load_clicked:
         reviewed = None
         if reviewed_filter == "Yes":
             reviewed = True
@@ -86,16 +111,13 @@ def render() -> None:
             SS.saved_records, start_date or None, end_date or None
         )
         SS.saved_loaded = True
-        info_col.caption(
+        st.caption(
             f"Loaded {len(SS.saved_records)} record(s) from Database with the "
             "current filters."
         )
     elif not SS.saved_loaded:
         SS.saved_records = supabase_service.get_all_invoice_records()
         SS.saved_loaded = True
-        info_col.caption(
-            f"Auto-loaded {len(SS.saved_records)} record(s) from Database."
-        )
 
     if not SS.saved_records:
         st.caption("No records match the current filters.")
@@ -104,10 +126,15 @@ def render() -> None:
     frame = pd.DataFrame([ui_helpers.record_to_row(r) for r in SS.saved_records])
     frame["Reviewed"] = [bool(r.get("reviewed")) for r in SS.saved_records]
 
+    st.caption(
+        ":red[Unsaved changes]" if pending else ":green[All changes saved]"
+    )
+
     edited = st.data_editor(
         frame,
         key="saved_editor",
         width="stretch",
+        on_change=_mark_edited,
         column_config={
             "Invoice Date": st.column_config.TextColumn("Invoice Date"),
             "Sub total": st.column_config.NumberColumn("Sub total", format="%.2f"),
@@ -117,6 +144,10 @@ def render() -> None:
     )
 
     records = edited.to_dict("records")
+
+    if save_clicked:
+        _save_changes(records)
+
     validation = validators.validate_rows(records)
     if validation:
         st.warning(
@@ -127,10 +158,7 @@ def render() -> None:
         for item in validation[:25]:
             st.markdown(f"- **Row {item['row']}**: {', '.join(item['issues'])}")
 
-    col_a, col_b = st.columns(2)
-    if col_a.button("Save changes"):
-        _save_changes(records)
-    if col_b.button("Export current filtered records to Excel"):
+    if export_clicked:
         st.download_button(
             "Download filtered Excel file",
             data=excel_exporter.generate_excel_bytes(records),
@@ -160,6 +188,7 @@ def _save_changes(records: List[Dict]) -> None:
     saved = 0
     if to_save:
         saved = supabase_service.upsert_invoice_records(to_save)
+    SS.saved_edits = False
     ui_helpers.bump_revision()
     st.success(
         f"Upserted {saved} record(s); {skipped} row(s) skipped (missing invoice number)."

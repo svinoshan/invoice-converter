@@ -43,6 +43,46 @@ run("pages/upload_process.py", "upload_process")
 run("pages/saved_records.py", "saved_records")
 run("pages/settings.py", "settings")
 
+# Saved Records: Save/Export buttons sit ABOVE the table; Save is disabled
+# until an edit marks state as pending (same pattern as Upload & Process).
+from streamlit.testing.v1.element_tree import Block  # noqa: E402
+
+
+def _ordered_types(root):
+    """Walk the element tree in document order, collecting element type names."""
+    out = []
+    for _eid, nodes in root.children.items():
+        for node in nodes:
+            out.append(type(node).__name__.lower())
+            if isinstance(node, Block):
+                out.extend(_ordered_types(node))
+    return out
+
+
+at = AppTest.from_file(f"{ROOT}/app.py", default_timeout=20)
+at.run()
+at.switch_page("pages/saved_records.py")
+at.run()
+assert not at.exception, [str(e) for e in at.exception]
+buttons = [b.label for b in at.get("button")]
+print("saved_records buttons:", buttons)
+assert "Save changes" in buttons, buttons
+assert "Export to Excel" in buttons, buttons
+assert "Load saved records" in buttons, buttons
+save_button = [b for b in at.get("button") if b.label == "Save changes"][0]
+assert save_button.disabled, "Save changes should start disabled"
+captions = [c.value for c in at.get("caption")]
+assert ":green[All changes saved]" in captions, captions
+order = _ordered_types(at.main)
+print("types:", [t for t in order if t in ("button", "data_editor", "caption", "dataframe")])
+assert order.index("button") < order.index("dataframe"), "buttons above table"
+# An edit marks the state as pending: button enables, caption flips to red.
+at.session_state["saved_edits"] = True
+at.run()
+save_button = [b for b in at.get("button") if b.label == "Save changes"][0]
+assert not save_button.disabled, "Save changes should be enabled after an edit"
+assert ":red[Unsaved changes]" in [c.value for c in at.get("caption")], "caption"
+
 # Export section: exactly one download button per flow on the upload page.
 at = AppTest.from_file(f"{ROOT}/app.py", default_timeout=20)
 at.run()

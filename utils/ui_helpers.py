@@ -29,6 +29,7 @@ CLEARABLE_KEYS = (
     "saved_loaded",
     "last_batch_summary",
     "unsaved_edits",
+    "saved_edits",
 )
 
 
@@ -42,6 +43,7 @@ def init_state() -> None:
     SS.setdefault("revision", 0)          # bumped after writes to refresh caches
     SS.setdefault("last_batch_summary", None)
     SS.setdefault("unsaved_edits", False)
+    SS.setdefault("saved_edits", False)  # pending edits on the Saved Records page
     SS.setdefault("batch_override", 0)    # 0 = automatic chunking
     SS.setdefault("settings", {"ocr": True, "azure": False})
 

@@ -59,7 +59,28 @@ def render() -> None:
     st.divider()
 
     st.subheader("Session")
-    if st.button("Clear session data", use_container_width=True):
+    st.markdown(
+        """
+        <style>
+        div.st-key-clear_session_btn button[kind="secondary"] {
+            background-color: #dc2626;
+            border-color: #dc2626;
+            color: #ffffff;
+        }
+        div.st-key-clear_session_btn button[kind="secondary"]:hover {
+            background-color: #b91c1c;
+            border-color: #b91c1c;
+            color: #ffffff;
+        }
+        div.st-key-clear_session_btn button,
+        div.st-key-template_download_btn button {
+            min-width: 220px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("Clear session data", key="clear_session_btn"):
         ui_helpers.clear_workflow_state()
         ui_helpers.bump_revision()
         st.rerun()
@@ -69,6 +90,7 @@ def render() -> None:
         data=excel_exporter.generate_template_bytes(),
         file_name=get_export_filename("invoice_template"),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="template_download_btn",
     )
 
     st.divider()
