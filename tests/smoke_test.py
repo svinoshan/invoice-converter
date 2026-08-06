@@ -276,6 +276,73 @@ def _tropical_wrapped_line():
 check("parser: wrapped item description joins continuation lines", _tropical_wrapped_line)
 
 
+_YARANA_TEXT = (
+    "Invoice\n"
+    "YARANA TEXTILE MILLS Invoice ref:LKA/CUC/2026/06/1237\n"
+    "SUITE 304, 3RD FLOOR, UNI-TOWER, Date :18-Jun-26\n"
+    "ADJ. COTTON\n"
+    "EXCHANGE BUILDING,\n"
+    "I.I CHUNDRIGAR ROAD,\n"
+    "Karachi,South ,Postal code: 74000\n"
+    "Postal Code :\n"
+    "Pakistan\n"
+    "92-21-3246111\n"
+    "yaranatextile786@gmail.com\n"
+    "Description Quantity Rate Total\n"
+    "TC Charges - 01/02/2026-30/04/2026 1 105.00 € 105.00\n"
+    "Total Euro 105.00\n"
+    "One Hundred Five Euro Only\n"
+    "Payment Terms:\n"
+    "All bank charges are on Account of the Customer\n"
+    "Kindly include the invoice number in the Telegraphic Transfer Instructions\n"
+    "The Gross Invoice value is payable within 14days from the date of invoice\n"
+    "Payment Instructions:\n"
+    "Commercial Bank of Ceylon PLC\n"
+    "Reid Avenue Branch\n"
+    "ADD: No.104, Reid Avenue,\n"
+    "Colombo 04.\n"
+    "Control Union Inspections (Pvt) Ltd\n"
+    "A/C No: 8010003245\n"
+    "Account type: FEEA (EUR) SAVINGS\n"
+    "Swift/Bic No. CCEYLKLX\n"
+    "Authorised Signatory\n"
+)
+
+
+def _yarana_client_without_suffix():
+    parsed = invoice_parser.parse_invoice(_YARANA_TEXT)
+    assert parsed.client == "YARANA TEXTILE MILLS", parsed.client
+    assert parsed.invoice_no == "LKA/CUC/2026/06/1237"
+    assert parsed.invoice_date == "18-Jun-26", parsed.invoice_date
+    assert parsed.total_amount == 105.0, parsed.total_amount
+    assert parsed.currency == "Euro", parsed.currency
+
+
+check("parser: client without legal suffix + bank block ignored", _yarana_client_without_suffix)
+
+
+_PIERIS_TEXT = (
+    "SUSPENDED TAX INVOICE\n"
+    "Richard Pieris Natural Foams Ltd. Invoice ref: LKA/CUC/SVAT/2021/01/0689\n"
+    "Phase 1 - Export processing zone Project_ref: PRJ 821802\n"
+    "Postal code: 61170 Date: 21-01-2021\n"
+    "Description Quantity Rate Total :\n"
+    "Inspection of mattresses 1 500 500.00\n"
+    "Total value of the supply with SVAT USD 540.00\n"
+)
+
+
+def _pieris_long_header_line():
+    parsed = invoice_parser.parse_invoice(_PIERIS_TEXT)
+    assert parsed.client == "Richard Pieris Natural Foams Ltd.", parsed.client
+    assert parsed.invoice_no == "LKA/CUC/SVAT/2021/01/0689"
+    assert parsed.invoice_date == "21-Jan-21", parsed.invoice_date
+    assert parsed.total_amount == 540.0, parsed.total_amount
+
+
+check("parser: long name+ref line beats address line", _pieris_long_header_line)
+
+
 def _sub_total():
     assert invoice_parser.extract_sub_total(_SAMPLE_TEXT) == 1345.2
     assert invoice_parser.extract_sub_total("No labels here") is None

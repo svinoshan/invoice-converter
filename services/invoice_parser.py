@@ -287,7 +287,8 @@ _CLIENT_LABEL_RE = re.compile(
 _COMPANY_SUFFIX_RE = re.compile(
     r"\b(ltd\.?|limited|pvt\.?|private|co(?:rp)?\.?|corp\.?|corporation|inc\.?|"
     r"llc|gmbh|b\.v\.?|plc|srl|llp|company|enterprises?|exports?|imports?|"
-    r"industries|group|holdings?|associates?|trading)\b",
+    r"industries|group|holdings?|associates?|trading|mills?|textiles?|"
+    r"garments?|foods?|knitting|sugar|pharma|chemicals?|engineering)\b",
     re.IGNORECASE,
 )
 _IGNORED_PREFIXES = (
@@ -311,6 +312,25 @@ def _clean_label_value(raw: str) -> str:
     return s.strip(" ,:;-")
 
 
+def _is_bank_or_payment_line(lower: str) -> bool:
+    """True for payment-instruction / bank-detail lines - never the client."""
+    return any(
+        token in lower
+        for token in (" bank", "bank of", "a/c no", "account no",
+                      "account type", "swift", "payment", "payable")
+    )
+
+
+def _is_address_line(lower: str) -> bool:
+    """True for supplier address/reference lines - never the client."""
+    return any(
+        token in lower
+        for token in ("project_ref", "project ref", "postal code", "suite ",
+                      "floor,", "road,", "industrial park", "export processing zone",
+                      "building,", "lane,", "colombo", "street")
+    )
+
+
 def _looks_like_company(line: str) -> bool:
     line = line.strip()
     if not (3 <= len(line) <= 70):
@@ -319,6 +339,45 @@ def _looks_like_company(line: str) -> bool:
     if lower.startswith(_IGNORED_PREFIXES):
         return False
     if not _COMPANY_SUFFIX_RE.search(line):
+        return False
+    if _is_bank_or_payment_line(lower) or _is_address_line(lower):
+        return False
+    return True
+
+
+_ITEM_HEADER_WORDS = (
+    "description", "particulars", "quantity", "qty", "rate", "amount",
+    "total", "unit", "price", "value", "remarks", "sl no", "sl.no",
+    "serial no", "item", "details", "discount", "net",
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """Weak company check: 2+ alphabetic words, no pure-digit tokens, and
+    not a label/title line. Used as a last resort when the supplier name
+    has no legal suffix (e.g. "YARANA TEXTILE MILLS")."""
+    s = text.strip()
+    if not (3 <= len(s) <= 50):
+        return False
+    words = s.split()
+    alpha_words = [w for w in words if re.search(r"[A-Za-z]{2,}", w)]
+    if len(alpha_words) < 2:
+        return False
+    if any(w.replace(",", "").replace(".", "").isdigit() for w in words):
+        return False
+    lower = s.lower()
+    if lower.startswith(_IGNORED_PREFIXES):
+        return False
+    if _is_bank_or_payment_line(lower) or _is_address_line(lower):
+        return False
+    # Column-header lines ("Description Quantity Rate Total") are never a
+    # client name - require at most one header word.
+    header_hits = sum(
+        1
+        for word in _ITEM_HEADER_WORDS
+        if re.search(rf"\b{re.escape(word)}\b", lower)
+    )
+    if header_hits >= 2:
         return False
     return True
 
@@ -336,19 +395,34 @@ def extract_client_name(text: str) -> str:
     lines = [ln.strip() for ln in text.splitlines()[:15] if ln.strip()]
 
     for line in lines:
-        if _looks_like_company(line):
-            return _clean_label_value(line)
+        name = _clean_label_value(line)
+        if _looks_like_company(name):
+            return name
 
-    # The name often sits directly above the invoice reference block.
+    # The name often sits directly above the invoice reference block - or on
+    # the same line just before it ("YARANA TEXTILE MILLS Invoice ref:...").
     ref_match = _INVOICE_NO_RE.search(text)
     if ref_match:
+        line_start = text.rfind("\n", 0, ref_match.start()) + 1
+        same_line_prefix = _clean_label_value(text[line_start: ref_match.start()])
+        if same_line_prefix and _looks_like_company(same_line_prefix):
+            return same_line_prefix
+        if same_line_prefix and _looks_like_name(same_line_prefix):
+            return same_line_prefix
+
         preceding = text[: ref_match.start()]
         prior_lines = [ln.strip() for ln in preceding.splitlines() if ln.strip()][-3:]
         for line in reversed(prior_lines):
-            if _looks_like_company(line):
-                return _clean_label_value(line)
+            name = _clean_label_value(line)
+            if _looks_like_company(name):
+                return name
 
-    return _clean_label_value(lines[0]) if lines else ""
+    # Never fall back to a label/title line ("Invoice") - an empty client is
+    # flagged for review and safer than a wrong one.
+    for line in lines:
+        if _looks_like_name(line):
+            return _clean_label_value(line)
+    return ""
 
 
 # ---------------------------------------------------------------------------
