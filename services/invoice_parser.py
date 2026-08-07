@@ -28,6 +28,10 @@ _CURRENCY_MAP: Dict[str, str] = {
     "$": "USD",
     "usd": "USD",
     "us$": "USD",
+    "a$": "AUD",
+    "c$": "CAD",
+    "s$": "SGD",
+    "nz$": "NZD",
     "rs": "LKR",
     "rs.": "LKR",
     "lkr": "LKR",
@@ -53,9 +57,9 @@ _CURRENCY_MAP: Dict[str, str] = {
 }
 
 _CURRENCY_SCAN_RE = re.compile(
-    r"(\bEUR\b|\bEuro(?:s)?\b|€|\bUSD\b|\$|\bLKR\b|\bRs\.?\b|\bRupees\b|"
+    r"(\bEUR\b|\bEuro(?:s)?\b|€|\bUSD\b|(?:NZ|[ACSN])?\$|\bLKR\b|\bRs\.?\b|\bRupees\b|"
     r"\bGBP\b|£|\bJPY\b|¥|\bINR\b|₹|\bAED\b|\bAUD\b|\bCAD\b|\bSGD\b|"
-    r"\bCHF\b|\bTHB\b|\bMYR\b|\bRM\b|\bPHP\b)",
+    r"\bCHF\b|\bTHB\b|\bMYR\b|\bRM\b|\bPHP\b|\bNZD\b)",
     re.IGNORECASE,
 )
 
@@ -123,6 +127,12 @@ def clean_amount(value: object) -> Optional[float]:
         s,
         flags=re.IGNORECASE,
     ).strip()
+    s = re.sub(
+        r"(?:rs\.?|lkr|eur|usd|gbp|inr|aed|aud|cad|sgd|chf|thb|myr|php|rm)\s*\.?\s*$",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip()
 
     try:
         number = float(s)
@@ -181,6 +191,8 @@ def normalize_date(value: object) -> str:
     raw = str(value).strip().strip(".,;:()")
     if not raw:
         return ""
+    if raw.isdigit():
+        return ""  # a bare integer ("8") is a day/month fragment, not a date
 
     parsed: Optional[date] = None
 
@@ -190,9 +202,16 @@ def normalize_date(value: object) -> str:
     else:
         m = _NUMERIC_DATE_RE.match(raw)
         if m:
+            # Day-first is the local convention; fall back to month-first for
+            # US-style dates ("06/15/2026") when the day-first reading is
+            # invalid. When both readings are valid, day-first wins.
             parsed = _safe_date(
                 int(m.group(1)), int(m.group(2)), _two_digit_year(int(m.group(3)))
             )
+            if parsed is None:
+                parsed = _safe_date(
+                    int(m.group(2)), int(m.group(1)), _two_digit_year(int(m.group(3)))
+                )
         else:
             m = _MONTH_NAME_DATE_RE.match(raw)
             if m:
@@ -212,6 +231,44 @@ def normalize_date(value: object) -> str:
     return parsed.strftime("%d-%b-%y").lstrip("0")
 
 
+def _has_explicit_year(candidate: str) -> bool:
+    """True when a date candidate names its own year.
+
+    dateutil silently guesses the current year for year-less strings, so the
+    year the parser chose must actually appear in the text. A two-digit year
+    only counts when it is separated from the day ("18-Jun-26", "8/6/26") -
+    a bare day like "August 15," must never be read as a year.
+    """
+    try:
+        year = date_parser.parse(candidate, dayfirst=True).year
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if re.search(rf"(?<!\d){year}(?!\d)", candidate):
+        return True
+    short = year % 100
+    return bool(
+        re.search(
+            rf"(?i)(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+            rf"[a-z]*[.\-/ ]+{short}(?!\d)",
+            candidate,
+        )
+        or re.search(rf"(?<!\d)\d{{1,2}}[./\-]{short}(?!\d)", candidate)
+    )
+
+
+def _is_complete_date_candidate(candidate: str) -> bool:
+    """A date candidate must carry its own month *and* year - otherwise
+    dateutil fabricates the missing parts from today's date."""
+    has_month = bool(
+        re.search(
+            r"(?i)\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b",
+            candidate,
+        )
+        or re.search(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", candidate)
+    )
+    return has_month and _has_explicit_year(candidate)
+
+
 def extract_invoice_date(text: str) -> str:
     """Find and normalise the invoice date in ``text``."""
     if not text:
@@ -220,8 +277,13 @@ def extract_invoice_date(text: str) -> str:
     for match in _DATE_LABEL_RE.finditer(text):
         candidate = match.group(1).strip().strip(".:,")
         tokens = candidate.split()
-        for size in (1, 2):
-            norm = normalize_date(" ".join(tokens[:size]))
+        for size in (1, 2, 3):
+            candidate_txt = " ".join(tokens[:size])
+            # Reject partial guesses ("August 15,") - the explicit year in the
+            # full candidate ("August 15, 2026") must be found and used.
+            if not _is_complete_date_candidate(candidate_txt):
+                continue
+            norm = normalize_date(candidate_txt)
             if norm:
                 return norm
 
@@ -239,26 +301,79 @@ def extract_invoice_date(text: str) -> str:
 # Invoice number
 # ---------------------------------------------------------------------------
 
+# "Invoice No: INV-123" (explicit label) or a plain "Invoice: 12345". The
+# plain-label alternative must stay on the same line (so a "TAX INVOICE"
+# heading can never capture the company name on the next line) and must
+# contain a digit ("No invoice here" is prose, not a reference).
 _INVOICE_NO_RE = re.compile(
     r"(?:invoice\s*(?:ref(?:erence)?|no\.?|number|#)|inv\s*no\.?)\s*[:#]?\s*"
-    r"([A-Za-z0-9][A-Za-z0-9/\\\-._ ]{2,80})",
+    r"([A-Za-z0-9][A-Za-z0-9/\\\-._ ]{2,80})"
+    r"|\binvoice[ \t]*[:#]?[ \t]*(?=[^\n]*[0-9])([A-Za-z0-9][^\n]{1,39})",
     re.IGNORECASE,
 )
-_BARE_REF_RE = re.compile(r"\b([A-Z0-9]{2,10}(?:/[-A-Z0-9]+){2,})\b", re.IGNORECASE)
+# One slash/dash segment is enough ("INV-001", "INV/2026"), but the ref must
+# contain a digit - otherwise bare words like "NET" or "VAT" would match.
+_BARE_REF_RE = re.compile(
+    r"\b(?=[A-Z0-9/\\-]*\d)([A-Z0-9]{2,10}(?:[/\\-][-A-Z0-9]+){1,})\b",
+    re.IGNORECASE,
+)
+
+_REF_DATE_RE = re.compile(
+    r"(?:\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"
+    r"|\d{1,2}[-/.\s](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*"
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s.\-/]*\d{2,4}"
+    r"|\d{4}[-/.]\d{1,2}[-/.]\d{1,2})",
+    re.IGNORECASE,
+)
+
+
+_INVOICE_REF_LABELS = (
+    "date", "dated", "amount", "total", "due", "qty", "quantity", "rate",
+    "currency", "tel", "telephone", "email", "e-mail", "invoice", "payment",
+    "balance", "vat", "tax", "no", "no.",
+)
+_REF_DATE_TOKEN_RE = re.compile(r"\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}")
 
 
 def _clean_invoice_ref(raw: str) -> str:
     raw = raw.strip().strip(".:,;")
-    raw = re.split(r"\b(date|dated)\s*[:#]?\b", raw, maxsplit=1, flags=re.I)[0].strip()
+    raw = re.split(
+        r"\b(date|dated|amount|total|due|qty|quantity|rate|currency|"
+        r"tel(?:ephone)?|email|e-mail|invoice|payment|balance|vat|tax)"
+        r"\s*[:#]?\b",
+        raw,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
     tokens = raw.split()
     if not tokens:
         return ""
     if len(tokens) == 1:
-        return tokens[0].rstrip(".,:;")
-    first = tokens[0]
-    if "/" in first or ("-" in first and any(ch.isdigit() for ch in first)):
-        return first.rstrip(".,:;")
-    return " ".join(tokens[:2]).rstrip(".,:;")
+        ref = tokens[0].rstrip(".,:;")
+    else:
+        first = tokens[0]
+        if "/" in first or ("-" in first and any(ch.isdigit() for ch in first)):
+            ref = first.rstrip(".,:;")
+        else:
+            # Multiple space-separated segments ("TC 2026 06 0012"): keep
+            # joining ref-like tokens, but stop at label words or inline dates.
+            out: List[str] = []
+            for token in tokens:
+                clean = token.rstrip(".:,;")
+                if out and (
+                    clean.lower() in _INVOICE_REF_LABELS
+                    or _REF_DATE_TOKEN_RE.fullmatch(clean)
+                ):
+                    break
+                out.append(clean)
+                if len(out) >= 4:
+                    break
+            ref = " ".join(out).rstrip(".,:;")
+    # A cleaned value that is really a date ("15 Aug 2026", "26-04-2024")
+    # means the label was followed by a date, not an invoice number.
+    if not ref or _REF_DATE_RE.match(ref):
+        return ""
+    return ref
 
 
 def extract_invoice_number(text: str) -> str:
@@ -267,11 +382,13 @@ def extract_invoice_number(text: str) -> str:
         return ""
     match = _INVOICE_NO_RE.search(text)
     if match:
-        cleaned = _clean_invoice_ref(match.group(1))
+        cleaned = _clean_invoice_ref(match.group(1) or match.group(2))
         if cleaned:
             return cleaned
     match = _BARE_REF_RE.search(text)
-    return match.group(1) if match else ""
+    if match and not _REF_DATE_RE.match(match.group(1)):
+        return match.group(1)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +397,7 @@ def extract_invoice_number(text: str) -> str:
 
 _CLIENT_LABEL_RE = re.compile(
     r"(?:client|customer|buyer|bill\s*to|consignee|sold\s*to|"
-    r"messrs\.?\s*|m\.?\s*[/.]\s*s\.?\s*|m\.\s*)"
+    r"messrs\.?\s*|m\.?\s*[/.]\s*s\.?\s*)"
     r"\s*[:#.]?\s*([A-Za-z0-9][^\n]{2,80})",
     re.IGNORECASE,
 )
@@ -296,12 +413,19 @@ _IGNORED_PREFIXES = (
     "phone", "fax", "email", "e-mail", "web", "www", "http", "page", "currency",
     "terms", "amount", "total", "qty", "quantity", "rate", "attn", "attention",
     "for", "vat", "tax", "bank", "swift", "a/c", "acct", "account",
+    "bill to", "sold to", "customer", "client", "buyer", "consignee",
 )
 
 
 def _clean_label_value(raw: str) -> str:
     """Trim trailing label noise (e.g. 'Acme Ltd, Invoice No: INV-1')."""
     s = re.sub(r"\s+", " ", raw.strip().strip(":#.,;-")).strip()
+    s = re.sub(
+        r"^(?:bill\s*to|sold\s*to|customer|client|buyer|consignee|messrs\.?)\s*[:#.]?\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    ).strip(" ,:;-")
     s = re.split(
         r"\b(invoice\s*(?:no|ref|number|date)|inv\s*no|tel(?:ephone)?|fax|"
         r"email|e-mail|www|http|vat\s*no|date|dated|currency)\b",
@@ -456,15 +580,14 @@ _SKIP_DESC_PREFIXES = (
     "fax:", "email:", "e-mail:", "www", "http", "bank:", "swift", "vat",
     "a/c", "date :", "date:", "dated", "total", "sub total", "currency",
     "bill to", "ship to", "client", "customer", "attn", "balance", "no.",
-    "no:", "no ",
+    "no:", "no ", "exchange", "discount", "advance", "deposit", "tax",
 )
 
 
 def _is_year_like(token: str) -> bool:
-    digits = token.replace(",", "")
-    if not re.fullmatch(r"\d{4}", digits):
+    if not re.fullmatch(r"-?\d{4}", token):
         return False
-    return 1900 <= int(digits) <= 2100
+    return 1900 <= int(token) <= 2100
 
 
 def _is_amount_token(token: str) -> bool:
@@ -473,7 +596,9 @@ def _is_amount_token(token: str) -> bool:
     cleaned = token.replace(",", "")
     if not re.fullmatch(r"-?\d+(\.\d{1,2})?", cleaned):
         return False
-    if "." not in cleaned and _is_year_like(cleaned):
+    # A bare 4-digit integer between 1900-2100 is a year, not money - but an
+    # amount written with a thousands separator ("2,000") can never be a year.
+    if "." not in token and _is_year_like(token):
         return False
     return True
 
@@ -487,12 +612,23 @@ _ITEM_TABLE_HEADER_SIMPLE_RE = re.compile(
     r"\b(?:description|particulars|item)\b.*\b(?:amount|total|value|rate|price)\b",
     re.IGNORECASE,
 )
-_ITEM_REGION_STOP_FRAGMENTS = (
-    "sub total", "subtotal", "grand total", "total amount", "total due",
-    "total", "svat", "vat", "tax", "exchange", "payment", "terms", "bank",
-    "swift", "signatory", "page", "discount", "advance", "deposit", "road",
-    "street", "avenue", "lane", "colombo", "address", "add :", "add:",
-    "telephone", "phone", "email", "www", "fax",
+# Summary rows that end the item region. They must sit at the start of the
+# line (optionally after a leading amount/currency token, e.g. "270.00 VAT
+# 48.60") AND carry a money-like figure - "Total cleaning of warehouse - 5
+# days" or "Foreign Exchange Consulting" are descriptions, not summary rows,
+# so they must survive the region.
+_ITEM_REGION_SUMMARY_RE = re.compile(
+    r"^(?:\S*[\d.,]+[ \t]+)*(?:sub\s*total|subtotal|grand\s*total|total\s*amount|"
+    r"total\s*due|total|svat|vat|tax|exchange|discount|advance|deposit|"
+    r"balance|add\s*:|add:)\b",
+    re.IGNORECASE,
+)
+# Payment/contact blocks below the table end the item region wherever they
+# appear - real item descriptions rarely contain these words.
+_ITEM_REGION_STOP_RE = re.compile(
+    r"\b(?:payment|terms|bank|swift|signatory|page|telephone|phone|"
+    r"email|www|fax)\b",
+    re.IGNORECASE,
 )
 
 
@@ -512,8 +648,14 @@ def _find_item_region(lines: Sequence[str]) -> int:
 
 
 def _is_region_stop_line(line: str) -> bool:
-    lower = line.lower()
-    return any(fragment in lower for fragment in _ITEM_REGION_STOP_FRAGMENTS)
+    if _ITEM_REGION_STOP_RE.search(line):
+        return True
+    if not _ITEM_REGION_SUMMARY_RE.match(line):
+        return False
+    # A summary row carries exactly one figure - a line that starts with a
+    # summary word but holds several numbers ("Total cleaning of warehouse -
+    # 5 days 500.00 500.00") is a description, not a total row.
+    return len(_numeric_amounts_from_line(line)) == 1
 
 
 def _looks_like_item_text(line: str) -> bool:
@@ -546,16 +688,19 @@ def _parse_item_line(
 
         # A bare integer with no decimals is rarely money - it is usually an
         # area/postal code, index or quantity ("Colombo 08", "page 4",
-        # "Project_ref: PRJ 866806"). Only accept it when a currency token
-        # sits right next to it, it is a small number, or we are inside a
-        # recognised item table where the last column is the amount.
+        # "Project_ref: PRJ 866806", "3 Days @ Euro 500/Day"). Only accept it
+        # when a currency token sits right next to it, or - inside a
+        # recognised item table - when it sits in the amount column (the last
+        # tokens of the line: "Service Fee 50", "Item 2 135 270").
         is_bare_integer = "." not in raw_amount and "," not in raw_amount
         if is_bare_integer:
             next_to_currency = bool(
                 (i - 1 >= 0 and normalize_currency(tokens[i - 1]))
                 or (i + 1 < len(tokens) and normalize_currency(tokens[i + 1]))
             )
-            if not next_to_currency and (not table_mode or amount < 100):
+            if not next_to_currency and (
+                not table_mode or i < len(tokens) - 2
+            ):
                 continue
 
         desc_tokens = tokens[:i]
@@ -670,10 +815,13 @@ def extract_descriptions(text: str, default_currency: str = "") -> List[str]:
 #     the final payable amount usually appears at the bottom of the invoice.
 # ---------------------------------------------------------------------------
 
-_TOTAL_EXCLUDED = (
-    "sub total", "subtotal", "tax amount", "tax", "vat", "excise", "cess",
-    "levy", "exchange rate", "exch rate", "discount", "less:", "advance",
-    "deposit", "paid", "round off", "quantity", "qty",
+# Lines that are clearly not the final payable. Word-boundary matching only -
+# and deliberately no "paid": "Total Amount Paid" IS the payable.
+_TOTAL_EXCLUDED_RE = re.compile(
+    r"\b(?:sub\s*total|subtotal|tax\s*amount|tax|vat|excise|cess|levy|"
+    r"exchange\s*rate|exch\s*rate|discount|less\s*:|advance|deposit|"
+    r"round\s*off|quantity|qty)\b",
+    re.IGNORECASE,
 )
 
 _TOTAL_PATTERNS = (
@@ -683,9 +831,12 @@ _TOTAL_PATTERNS = (
     (re.compile(r"\btotal\s*payable\b"), 9),
     (re.compile(r"\bamount\s*(?:due|owing|payable)\b"), 9),
     (re.compile(r"\bbalance\s*due\b"), 8),
-    (re.compile(r"\bnet\s*amount\b"), 8),
     (re.compile(r"\bbalance\b"), 7),
     (re.compile(r"\btotal\b"), 5),
+    # "Net Amount" is semantically a pre-tax subtotal - it must never outrank
+    # a plain "Total". Rank 3 keeps it as a last resort for invoices whose
+    # only payable line is "Net Amount".
+    (re.compile(r"\bnet\s*amount\b"), 3),
 )
 
 # On SVAT / suspended-tax invoices the final payable is the supply value
@@ -758,10 +909,21 @@ def _words_to_number(text: str) -> Optional[float]:
         cents = round(int(fraction.group(1)) * 100 / int(fraction.group(2)))
         found = True
 
+    # A spelled-out 'cents' phrase ("...and forty cents") must be parsed and
+    # removed BEFORE the main loop - otherwise the same words are counted
+    # twice (once as main digits, once as cents).
     for i, word in enumerate(words):
-        if word.startswith("cent"):  # 'cents' marks the decimal phrase
-            cents = _parse_small_number(words[max(0, i - 3):i])
-            continue
+        if word.startswith("cent"):
+            start = max(0, i - 3)
+            for j in range(i - 1, start - 1, -1):
+                if words[j] == "and":
+                    start = j + 1
+                    break
+            cents = _parse_small_number(words[start:i])
+            del words[start : i + 1]
+            break
+
+    for i, word in enumerate(words):
         if word in ("hundred",):
             track = track * 100 if track else 100
         elif word in ("thousand", "million"):
@@ -779,55 +941,99 @@ def _words_to_number(text: str) -> Optional[float]:
     return round(total + cents / 100, 2)
 
 
-def _extract_numeric_from_line(line: str) -> Optional[float]:
-    """Return the last plausible money amount found on a single line."""
+def _numeric_amounts_from_line(line: str) -> List[float]:
+    """All plausible money amounts found on a single line, in order."""
     amounts = []
     for token in re.findall(r"-?[\d,]+(?:\.\d{1,2})?", line):
         value = clean_amount(token)
         if value is None:
             continue
-        # Ignore year-like numbers such as '2026'.
-        if value.is_integer() and 1900 <= value <= 2100:
+        # Ignore bare 4-digit year-like numbers such as '2026' - but never
+        # amounts with decimals or thousands separators ('1,980.00' is money,
+        # not a year).
+        if (
+            value.is_integer()
+            and 1900 <= value <= 2100
+            and re.fullmatch(r"-?\d{4}", token)
+        ):
             continue
         amounts.append(value)
+    return amounts
+
+
+def _extract_numeric_from_line(line: str) -> Optional[float]:
+    """Return the last plausible money amount found on a single line."""
+    amounts = _numeric_amounts_from_line(line)
     return amounts[-1] if amounts else None
 
 
-def _total_candidate_amount(lines: List[str], index: int) -> Optional[float]:
-    """Find the amount belonging to a total label line.
+def _first_numeric_from_line(line: str) -> Optional[float]:
+    """Return the first plausible money amount found on a single line."""
+    amounts = _numeric_amounts_from_line(line)
+    return amounts[0] if amounts else None
 
-    Looks at the label line first (numeric, then spelled-out words), then at
-    up to two following lines (some invoices put the number underneath the
-    label, e.g. after a spelled-out 'Total : Euro One Thousand ...').
+
+_TAX_RATE_LINE_RE = re.compile(
+    r"\b(?:vat|svat|tax|rate|discount|exchange)\b|%", re.IGNORECASE
+)
+
+
+def _total_candidate_amount(
+    lines: List[str], index: int, label_end: int = 0
+) -> Optional[float]:
+    """Find the amount belonging to a total/subtotal label line.
+
+    Looks at the label line first (spelled-out words, then the numeric amount
+    that follows the label), then at up to two following lines (some invoices
+    put the number underneath the label, e.g. after a spelled-out 'Total :
+    Euro One Thousand ...'). Only the text *after* the label counts, so a line
+    like "Sub Total 1,000.00 VAT 150.00" never returns the tax figure. The
+    lookahead stops at tax/rate lines so a "Total:" label never grabs the VAT
+    figure printed below it.
     """
     for offset in range(3):
         line_index = index + offset
         if line_index >= len(lines):
             break
+        if offset > 0 and _TAX_RATE_LINE_RE.search(lines[line_index]):
+            break
         # Spelled-out amounts win over stray numbers (e.g. a '50/100' cents
-        # fraction would otherwise be read as 100).
+        # fraction would otherwise be read as 100) - but the written words are
+        # typed by humans and often contain typos ("Eightteen"), so when the
+        # label line also carries a numeric amount and they disagree, the
+        # machine-typed numeric wins. A "50/100" fraction on the same line
+        # (contains "/") keeps the words as the authority.
         amount = _words_to_number(lines[line_index])
         if amount is not None:
+            if offset == 0 and "/" not in lines[line_index]:
+                numeric = _first_numeric_from_line(lines[line_index][label_end:])
+                if numeric is not None and abs(numeric - amount) > 0.005:
+                    return numeric
             return amount
-        amount = _extract_numeric_from_line(lines[line_index])
+        if offset == 0:
+            amount = _first_numeric_from_line(lines[line_index][label_end:])
+        else:
+            amount = _extract_numeric_from_line(lines[line_index])
         if amount is not None:
             return amount
     return None
 
 
-def _total_label_rank(lower_line: str) -> Optional[int]:
-    """Return the priority of the total label found on a line, or None."""
+def _total_label_match(lower_line: str) -> Optional[Tuple[int, int]]:
+    """Return (priority, match end) of the total label found on a line."""
     for pattern, rank in _TOTAL_PATTERNS:
-        if pattern.search(lower_line):
-            return rank
+        match = pattern.search(lower_line)
+        if match:
+            return rank, match.end()
     return None
 
 
-def _subtotal_label_rank(lower_line: str) -> Optional[int]:
-    """Return the priority of the subtotal label found on a line, or None."""
+def _subtotal_label_match(lower_line: str) -> Optional[Tuple[int, int]]:
+    """Return (priority, match end) of the subtotal label found on a line."""
     for pattern, rank in _SUBTOTAL_PATTERNS:
-        if pattern.search(lower_line):
-            return rank
+        match = pattern.search(lower_line)
+        if match:
+            return rank, match.end()
     return None
 
 
@@ -844,12 +1050,21 @@ def extract_sub_total(text: str) -> Optional[float]:
     candidates: List[tuple] = []
     for index, line in enumerate(lines):
         lower = line.lower()
-        if any(keyword in lower for keyword in _SUBTOTAL_EXCLUDED):
+        match = _subtotal_label_match(lower)
+        if match is None:
             continue
-        rank = _subtotal_label_rank(lower)
-        if rank is None:
+        rank = match[0]
+        # A labelled "Sub Total (before VAT adjustment)" IS the subtotal and
+        # must not be dropped - only stronger *final* total labels disqualify
+        # a line. Bare "VAT 15% ..." lines never reach here (no label -> None).
+        if any(
+            kw in lower
+            for kw in ("grand total", "invoice total", "total amount",
+                       "total payable", "amount due", "amount owing",
+                       "balance due")
+        ):
             continue
-        amount = _total_candidate_amount(lines, index)
+        amount = _total_candidate_amount(lines, index, match[1])
         if amount is not None:
             candidates.append((rank, index, amount))
 
@@ -862,6 +1077,13 @@ def extract_sub_total(text: str) -> Optional[float]:
     return round(chosen[2], 2)
 
 
+_TAX_INCLUSIVE_RE = re.compile(
+    r"\((?:incl|including|incl\.|inclusive|inclusive\s+of|with|plus|after)\b|"
+    r"\b(?:incl\.?|including|inclusive\s+of)\b",
+    re.IGNORECASE,
+)
+
+
 def extract_total_amount(text: str) -> Optional[float]:
     """Return the most likely final invoice payable amount, or ``None``.
 
@@ -869,7 +1091,9 @@ def extract_total_amount(text: str) -> Optional[float]:
     before ranking. When several total-like values exist, the value with the
     most explicit label and the latest position in the document wins. On
     SVAT / suspended-tax invoices the "Total value of the supply with SVAT"
-    line is the final payable and outranks plain "Total" lines.
+    line is the final payable and outranks plain "Total" lines. Lines whose
+    label says the tax is *included* ("Total (Including Tax)") are final
+    payables too, so they are exempt from the exclusion.
     """
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not lines:
@@ -879,14 +1103,19 @@ def extract_total_amount(text: str) -> Optional[float]:
     for index, line in enumerate(lines):
         lower = line.lower()
         is_svat_total = bool(_TOTAL_SVAT_RE.search(lower))
-        if not is_svat_total and any(keyword in lower for keyword in _TOTAL_EXCLUDED):
+        if (
+            not is_svat_total
+            and not _TAX_INCLUSIVE_RE.search(lower)
+            and _TOTAL_EXCLUDED_RE.search(lower)
+        ):
             continue
-        rank = _total_label_rank(lower)
-        if rank is None:
+        match = _total_label_match(lower)
+        if match is None:
             continue
+        rank = match[0]
         if is_svat_total:
             rank = max(rank, 11)
-        amount = _total_candidate_amount(lines, index)
+        amount = _total_candidate_amount(lines, index, match[1])
         if amount is not None:
             candidates.append((rank, index, amount))
 

@@ -321,6 +321,197 @@ def _yarana_client_without_suffix():
 check("parser: client without legal suffix + bank block ignored", _yarana_client_without_suffix)
 
 
+def _review_fix_dates():
+    assert invoice_parser.normalize_date("06/15/2026") == "15-Jun-26"
+    assert invoice_parser.normalize_date("08/06/2026") == "8-Jun-26"
+    assert invoice_parser.normalize_date("8") == ""
+    assert invoice_parser.extract_invoice_date("Invoice Date : 8 June 2026\n") == "8-Jun-26"
+    assert invoice_parser.extract_invoice_date("Invoice Date : 18 Jun 2026\n") == "18-Jun-26"
+
+
+check("review fix: MM/DD fallback + 3-token dates", _review_fix_dates)
+
+
+def _review_fix_invoice_no():
+    assert invoice_parser.extract_invoice_number("Invoice No: TC 2026 06 0012") == "TC 2026 06 0012"
+    assert invoice_parser.extract_invoice_number("Invoice No: INV-123 Date: 01-Jun-26") == "INV-123"
+    assert invoice_parser.extract_invoice_number("Invoice No: LKA/CUC/SVAT/2020/09/0402") == "LKA/CUC/SVAT/2020/09/0402"
+
+
+check("review fix: multi-segment refs + inline labels", _review_fix_invoice_no)
+
+
+def _review_fix_client_and_currency():
+    text = (
+        "Invoice\n"
+        "M. Perera, Accounts Department\n"
+        "M/s Grand Textiles (Pvt) Ltd\n"
+        "Invoice ref: LKA/CUC/2026/01/0001\n"
+    )
+    assert invoice_parser.extract_client_name(text) == "Grand Textiles (Pvt) Ltd"
+    assert invoice_parser.normalize_currency("A$") == "AUD"
+    assert invoice_parser.normalize_currency("C$") == "CAD"
+    assert invoice_parser.normalize_currency("S$") == "SGD"
+    assert invoice_parser.normalize_currency("$") == "USD"
+
+
+check("review fix: M. ignored, M/s works, dollar variants", _review_fix_client_and_currency)
+
+
+def _review_fix_totals():
+    assert invoice_parser.extract_total_amount("Total (Including Tax) 1,234.00\nPayment Terms: x") == 1234.0
+    assert invoice_parser.extract_sub_total("Sub Total (before VAT adjustment) 500.00\nVAT 100.00") == 500.0
+    assert invoice_parser.extract_total_amount("Total:\nVAT 15% 750.00\nTotal amount 1,000.00") == 1000.0
+    assert invoice_parser.clean_amount("5,000.00 LKR") == 5000.0
+    assert invoice_parser.clean_amount("1,250.00 rs.") == 1250.0
+
+
+check("review fix: tax-inclusive totals, lookahead, trailing currency", _review_fix_totals)
+
+
+def _review_fix_region_stop():
+    text = (
+        "Invoice\n"
+        "ACME Sizing Mills\n"
+        "Invoice ref: LKA/CUC/2026/09/0011\n"
+        "Description Quantity Rate Total\n"
+        "Transport Colombo Road to Kandy 1 5,000.00 5,000.00\n"
+        "Total 5,000.00\n"
+        "Payment Terms: 30 days\n"
+    )
+    assert invoice_parser.extract_descriptions(text) == ["Transport Colombo Road to Kandy"]
+
+
+check("review fix: road item not stopped by region guard", _review_fix_region_stop)
+
+
+def _misspelled_words_total():
+    text = (
+        "TAX INVOICE\n"
+        "Sri Lanka Natural Spice & Herbal Products Invoice ref: LKA/CUC/2024/04/0122\n"
+        "Description Quantity Rate Total :\n"
+        "TC Charges 01/11/2023 - 31/12/2023 1 270 270.00\n"
+        "Sub total EUR 270.00\n"
+        "Tax amount 48.60\n"
+        "EUR Three Hundred and Eightteen and Sixty cents only Total : EUR 318.60\n"
+    )
+    assert invoice_parser.extract_total_amount(text) == 318.6
+
+
+check("total: typo words but numeric on line wins", _misspelled_words_total)
+
+
+def _review2_client_fallback():
+    text = (
+        "TAX INVOICE\n"
+        "Bill To: John Doe\n"
+        "Acme Spice Mills Pvt Ltd\n"
+        "Invoice ref: LKA/CUC/2024/04/0122\n"
+    )
+    assert invoice_parser.extract_client_name(text) == "Acme Spice Mills Pvt Ltd"
+    text_no_suffix = "TAX INVOICE\nBill To: John Doe\nYARANA TEXTILE MILLS\nInvoice ref: LKA/2\n"
+    assert invoice_parser.extract_client_name(text_no_suffix) == "YARANA TEXTILE MILLS"
+    assert invoice_parser.extract_client_name("Invoice\nBill To: John Doe\nTotal 500.00\n") == ""
+
+
+check("review2: customer labels never leak into client", _review2_client_fallback)
+
+
+def _review2_amounts():
+    assert invoice_parser._is_amount_token("2,000")
+    assert not invoice_parser._is_amount_token("2000")
+    items = invoice_parser.extract_line_items("Consultation Fee 2,000\n", "USD")
+    assert [(i.description, i.amount) for i in items] == [("Consultation Fee", 2000.0)]
+    items = invoice_parser.extract_line_items(
+        "Description Quantity Rate Total\nService Fee 1 50 50\n", "USD"
+    )
+    assert [(i.description, i.amount) for i in items] == [("Service Fee", 50.0)]
+
+
+check("review2: comma'd 2,000 is money, bare 2000 is a year, table small ints", _review2_amounts)
+
+
+def _review2_same_line_tax():
+    assert invoice_parser.extract_sub_total("Sub Total 1,000.00 VAT 150.00\n") == 1000.0
+    assert invoice_parser.extract_total_amount("Rate: 135.00 Total: 2,000.00\n") == 2000.0
+
+
+check("review2: totals never cross tax columns on the same line", _review2_same_line_tax)
+
+
+def _review2_dates():
+    assert invoice_parser.extract_invoice_date("Date: August 15, 2026\n") == "15-Aug-26"
+    assert invoice_parser.extract_invoice_date("Date : 15-Aug\n") == ""
+    assert invoice_parser.extract_invoice_date("Date : 2026\n") == ""
+    assert invoice_parser.extract_invoice_date("Invoice Date : 8 June 2026\n") == "8-Jun-26"
+
+
+check("review2: dates need explicit month and year", _review2_dates)
+
+
+def _review2_invoice_no():
+    assert invoice_parser.extract_invoice_number("Invoice: 12345\n") == "12345"
+    assert invoice_parser.extract_invoice_number("Invoice: 12\n") == "12"
+    assert invoice_parser.extract_invoice_number("Invoice 15 Aug 2026\n") == ""
+    assert invoice_parser.extract_invoice_number("No invoice here\n") == ""
+    assert invoice_parser.extract_invoice_number("Invoice No: 26-04-2024\n") == ""
+    assert invoice_parser.extract_invoice_number(
+        "TAX INVOICE\nSri Lanka Spice Pvt Ltd\nInvoice No: LKA/CUC/2024/04/0122\n"
+    ) == "LKA/CUC/2024/04/0122"
+    assert invoice_parser.extract_invoice_number("INV-001\n") == "INV-001"
+    assert invoice_parser.extract_invoice_number("INV/2026\n") == "INV/2026"
+    assert invoice_parser.extract_invoice_number("NET\nVAT\nPAY\n") == ""
+
+
+check("review2: plain Invoice: label, bare one-segment refs, date guards", _review2_invoice_no)
+
+
+def _review2_net_amount():
+    assert invoice_parser.extract_total_amount(
+        "Net Amount 10,000.00\nVAT 1,500.00\nTotal 11,500.00\n"
+    ) == 11500.0
+    assert invoice_parser.extract_total_amount("Net Amount 1,000.00\n") == 1000.0
+    assert invoice_parser.extract_sub_total("Net Amount 10,000.00\n") == 10000.0
+
+
+check("review2: net amount never outranks total", _review2_net_amount)
+
+
+def _review2_excluded_words():
+    assert invoice_parser.extract_total_amount(
+        "Total Amount Paid 5,000.00\n"
+    ) == 5000.0
+    assert invoice_parser.extract_total_amount(
+        "Total (excl. tax) 1,000.00\nVAT 150.00\nTotal 1,150.00\n"
+    ) == 1150.0
+
+
+check("review2: word-boundary total exclusions", _review2_excluded_words)
+
+
+def _review2_region_stop():
+    text = (
+        "Description Quantity Rate Total\n"
+        "Total cleaning of warehouse - 5 days 500.00 500.00\n"
+        "Painting works 2 250.00 500.00\n"
+        "Foreign Exchange Consulting 2 250 500.00\n"
+    )
+    assert [(i.description, i.amount) for i in invoice_parser.extract_line_items(text, "USD")] == [
+        ("Painting works", 500.0),
+        ("Foreign Exchange Consulting", 500.0),
+    ]
+    stop_text = (
+        "Description Quantity Rate Total\n"
+        "Item A 1 100 100.00\n"
+        "Total value of the supply with SVAT USD 648.00\n"
+        "Item B 1 200 200.00\n"
+    )
+    assert invoice_parser.extract_descriptions(stop_text, "USD") == ["Item A"]
+
+
+check("review2: prose with total/exchange survives, summary rows still stop", _review2_region_stop)
+
+
 _PIERIS_TEXT = (
     "SUSPENDED TAX INVOICE\n"
     "Richard Pieris Natural Foams Ltd. Invoice ref: LKA/CUC/SVAT/2021/01/0689\n"
@@ -341,6 +532,53 @@ def _pieris_long_header_line():
 
 
 check("parser: long name+ref line beats address line", _pieris_long_header_line)
+
+
+_HEXAGON_TEXT = (
+    "TAX INVOICE\n"
+    "Hexagon Asia (Pvt) Ltd. Invoice ref: LKA/CUC/2021/03/1051\n"
+    "T2/34-B2, On Three20, Union Place, Project_ref: PRJ 869168\n"
+    "Colombo 02 Date: 24-03-2021\n"
+    "SRI LANKA\n"
+    "mahesh@hexagonasia.com\n"
+    "Description Quantity Rate Total :\n"
+    "Fee for GOLS Transaction Certificates for 1st July 2020 to 31st Dec 2020 66 30 1,980.00\n"
+    "Sub total EUR 1,980.00\n"
+    "Tax amount 158.40\n"
+    "1,980.00 VAT 158.40\n"
+    "158.40\n"
+    "EUR two thousand one hundred thirty eight and forty cents only Total : EUR 2,138.40\n"
+    "The LKR value of the VAT amount is 36802.66\n"
+    "Payment Terms:\n"
+    "All bank charges are on Account of the Customer\n"
+    "Kindly include the invoice number in the Telegraphic Transfer Instructions\n"
+    "The Gross Invoice value is payable within 14days from the date of invoice\n"
+    "Payment Instructions-\n"
+    "Commercial Bank Of Ceylon PLC Control Union Inspections (Pvt) Ltd\n"
+    "Reid Avenue Branch\n"
+    "ADD: No.104, Reid Avenue,\n"
+    "Colombo 04.\n"
+    "A/C No: 8010003245 Account type:FEEA (EUR) SAVINGS\n"
+    "Swift/Bic No. CCEYLKLX Authorised Signatory\n"
+    "VAT No. :114462322-7000\n"
+    "Page: 1 of 3\n"
+    "TC/ITC Annex\n"
+)
+
+
+def _hexagon_subtotal_and_cents_total():
+    parsed = invoice_parser.parse_invoice(_HEXAGON_TEXT)
+    assert parsed.client == "Hexagon Asia (Pvt) Ltd.", parsed.client
+    assert parsed.invoice_no == "LKA/CUC/2021/03/1051"
+    assert parsed.invoice_date == "24-Mar-21", parsed.invoice_date
+    assert parsed.sub_total == 1980.0, parsed.sub_total
+    assert parsed.total_amount == 2138.40, parsed.total_amount
+    assert parsed.descriptions == [
+        "Fee for GOLS Transaction Certificates for 1st July 2020 to 31st Dec 2020"
+    ], parsed.descriptions
+
+
+check("parser: subtotal 1,980.00 not treated as year + cents total", _hexagon_subtotal_and_cents_total)
 
 
 def _sub_total():
