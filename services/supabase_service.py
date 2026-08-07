@@ -148,6 +148,33 @@ def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _fetch_paginated(
+    query: Any, limit: int, order: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Fetch up to ``limit`` rows, paginating with ``range()``.
+
+    PostgREST returns at most 1000 rows per request by default, so a single
+    ``.limit()`` silently truncates larger tables. Walking offset ranges
+    collects every row up to the requested limit.
+    """
+    rows: List[Dict[str, Any]] = []
+    page_size = 1000
+    offset = 0
+    while len(rows) < limit:
+        page_query = query
+        if order:
+            page_query = page_query.order(order, desc=True)
+        response = page_query.range(offset, offset + page_size - 1).execute()
+        page = list(response.data or [])
+        if not page:
+            break
+        rows.extend(page)
+        if len(page) < page_size:
+            break
+        offset += page_size
+    return rows[:limit]
+
+
 def upsert_invoice_records(records: List[Dict[str, Any]]) -> int:
     """Upsert several invoices on ``invoice_no``; return the number upserted.
 
@@ -209,14 +236,14 @@ def update_reviewed_status(invoice_no: str, reviewed: bool) -> bool:
 
 
 def get_all_invoice_records(
-    limit: int = 2000, order: str = "invoice_date"
+    limit: int = 10000, order: str = "invoice_date"
 ) -> List[Dict[str, Any]]:
     """Return stored invoice records (newest invoice dates first)."""
     return get_invoice_records(limit=limit, order=order)
 
 
 def get_invoice_records(
-    limit: int = 2000,
+    limit: int = 10000,
     order: str = "invoice_date",
     status: Optional[str] = None,
     reviewed: Optional[bool] = None,
@@ -239,8 +266,7 @@ def get_invoice_records(
             iso = _to_iso_date(invoice_date)
             if iso:
                 query = query.eq("invoice_date", iso)
-        response = query.order(order, desc=True).limit(limit).execute()
-        return list(response.data or [])
+        return _fetch_paginated(query, limit=limit, order=order)
     except Exception as exc:
         logger.error("get_invoice_records failed: %s - %s", _friendly_error(exc), exc)
         return []
@@ -284,14 +310,12 @@ def get_invoice_summary_totals() -> Dict[str, Any]:
         by_currency: [{currency, count, total_amount}] sorted by total desc
     """
     try:
-        response = (
+        query = (
             _get_client()
             .table(_INVOICE_RECORDS_TABLE)
             .select("sub_total, total_amount, currency, extraction_status, reviewed, source_file_name")
-            .limit(10000)
-            .execute()
         )
-        records = list(response.data or [])
+        records = _fetch_paginated(query, limit=10000)
     except Exception as exc:
         logger.error("get_invoice_summary_totals failed: %s", exc)
         return {

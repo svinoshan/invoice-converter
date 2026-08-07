@@ -73,34 +73,24 @@ def render() -> None:
         "Invoice date to", value=None, key="sr_date_to"
     )
 
-    # Pending = any unsaved edit in the table below (same pattern as the
-    # Upload & Process "Save changes" button). Records loaded here are already
-    # persisted, so the button stays disabled until something is edited.
-    # .get() keeps this safe even if a hot-reloaded server still runs an older
-    # ui_helpers that has not initialized the flag yet.
-    pending = bool(SS.get("saved_edits", False))
+    # Records are fetched automatically: once on first visit, and again
+    # whenever any filter changes (no "Load saved records" button needed).
+    reviewed = None
+    if reviewed_filter == "Yes":
+        reviewed = True
+    elif reviewed_filter == "No":
+        reviewed = False
 
-    header_left, header_right = st.columns([2, 1], vertical_alignment="center")
-    with header_left:
-        load_clicked = st.button("Load saved records", type="primary")
-    with header_right:
-        col_e, col_s = st.columns(2, vertical_alignment="center", gap="small")
-        with col_e:
-            export_clicked = st.button("Export to Excel", width="stretch")
-        with col_s:
-            save_clicked = st.button(
-                "Save changes",
-                type="primary",
-                width="stretch",
-                disabled=not pending,
-            )
+    filter_key = (
+        status_filter,
+        reviewed_filter,
+        client_filter,
+        invoice_no_filter,
+        str(start_date or ""),
+        str(end_date or ""),
+    )
 
-    if load_clicked:
-        reviewed = None
-        if reviewed_filter == "Yes":
-            reviewed = True
-        elif reviewed_filter == "No":
-            reviewed = False
+    if not SS.saved_loaded or SS.get("saved_filter_key") != filter_key:
         SS.saved_records = supabase_service.get_invoice_records(
             status=None if status_filter == "All" else status_filter,
             reviewed=reviewed,
@@ -111,13 +101,53 @@ def render() -> None:
             SS.saved_records, start_date or None, end_date or None
         )
         SS.saved_loaded = True
+        SS.saved_filter_key = filter_key
+        # st.caption(
+        #     f"Fetched {len(SS.saved_records)} record(s) from the Database "
+        #     "with the current filters."
+        # )
+
+    # Pending = any unsaved edit in the table below (same pattern as the
+    # Upload & Process "Save changes" button). Records loaded here are already
+    # persisted, so the button stays disabled until something is edited.
+    # .get() keeps this safe even if a hot-reloaded server still runs an older
+    # ui_helpers that has not initialized the flag yet.
+    pending = bool(SS.get("saved_edits", False))
+
+    header_left, header_right = st.columns([2, 1], vertical_alignment="center")
+    with header_left:
         st.caption(
-            f"Loaded {len(SS.saved_records)} record(s) from Database with the "
-            "current filters."
+            f"Showing {len(SS.saved_records)} record(s) with the current filters."
         )
-    elif not SS.saved_loaded:
-        SS.saved_records = supabase_service.get_all_invoice_records()
-        SS.saved_loaded = True
+    with header_right:
+        col_e, col_s = st.columns(2, vertical_alignment="center", gap="small")
+        with col_e:
+            # Real download button (never gated behind a same-run click - that
+            # disappears on the download's own rerun and cancels the file).
+            # Exports the current editor values (including unsaved edits) via
+            # the editor's session-state value when it has been rendered,
+            # falling back to the loaded records otherwise.
+            editor_value = st.session_state.get("saved_editor")
+            export_records = (
+                editor_value.to_dict("records")
+                if isinstance(editor_value, pd.DataFrame)
+                else SS.saved_records
+            )
+            st.download_button(
+                "Export to Excel",
+                data=excel_exporter.generate_excel_bytes(export_records),
+                file_name=get_export_filename(),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                disabled=not SS.saved_records,
+                width="stretch",
+            )
+        with col_s:
+            save_clicked = st.button(
+                "Save changes",
+                type="primary",
+                width="stretch",
+                disabled=not pending,
+            )
 
     if not SS.saved_records:
         st.caption("No records match the current filters.")
@@ -178,15 +208,6 @@ def render() -> None:
                 hide_index=True,
                 width="stretch",
             )
-
-    if export_clicked:
-        st.download_button(
-            "Download filtered Excel file",
-            data=excel_exporter.generate_excel_bytes(records),
-            file_name=get_export_filename(),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        st.caption(f"Exported {len(records)} filtered record(s).")
 
 
 def _save_changes(records: List[Dict]) -> None:

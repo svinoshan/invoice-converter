@@ -45,6 +45,7 @@ run("pages/settings.py", "settings")
 
 # Saved Records: Save/Export buttons sit ABOVE the table; Save is disabled
 # until an edit marks state as pending (same pattern as Upload & Process).
+# Records auto-load and auto-refetch on filter changes (no Load button).
 from streamlit.testing.v1.element_tree import Block  # noqa: E402
 
 
@@ -67,8 +68,11 @@ assert not at.exception, [str(e) for e in at.exception]
 buttons = [b.label for b in at.get("button")]
 print("saved_records buttons:", buttons)
 assert "Save changes" in buttons, buttons
-assert "Export to Excel" in buttons, buttons
-assert "Load saved records" in buttons, buttons
+assert "Load saved records" not in buttons, buttons
+assert "Export to Excel" not in buttons, buttons
+downloads = [b.label for b in at.get("download_button")]
+print("saved_records downloads:", downloads)
+assert "Export to Excel" in downloads, downloads
 save_button = [b for b in at.get("button") if b.label == "Save changes"][0]
 assert save_button.disabled, "Save changes should start disabled"
 captions = [c.value for c in at.get("caption")]
@@ -148,6 +152,7 @@ class _FakeQuery:
     def ilike(self, *a): return self
     def order(self, *a, **k): return self
     def limit(self, *a): return self
+    def range(self, *a): return self
 
     def execute(self):
         return type("R", (), {"data": self.state["fake_data"], "count": None})()

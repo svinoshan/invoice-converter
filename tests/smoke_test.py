@@ -758,6 +758,10 @@ class _FakeQuery:
         self.state["limit"] = n
         return self
 
+    def range(self, start, end):
+        self.state["range"] = (start, end)
+        return self
+
     def maybe_single(self):
         self.state["maybe_single"] = True
         return self
