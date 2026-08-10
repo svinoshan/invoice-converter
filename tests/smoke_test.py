@@ -417,6 +417,120 @@ def _review2_client_fallback():
 check("review2: customer labels never leak into client", _review2_client_fallback)
 
 
+_PRIPA_SVAT_TEXT = (
+    "SUSPENDED TAX INVOICE\n"
+    "PRIPA Organic Colombo (Private) Limited Invoice ref: LKA/CUC/SVAT/2021/01/0698\n"
+    "Pitadepalawatte, Yatawaka Project_ref: PRJ 802099\n"
+    "Urapola Date: 15-01-2021\n"
+    "SRI LANKA\n"
+    "0094 33 2282429\n"
+    "adona@controlunion.com\n"
+    "VAT Registration no.. 114373958-7000\n"
+    "SVAT Registration no.. SVAT001108\n"
+    "Description Quantity Rate Total :\n"
+    "Inspection & Certification Fee for EEC for 2020 : 10 Days @ Euro 400/Day\n"
+    "(Offer Ref. No : CU/SL/2011/077) 10 400 4,000.00\n"
+    "Inspection & Certification Fee for NOP for 2020 : 2 Days @ Euro 450/Day\n"
+    "(Offer Ref. No: CU/SL/2011/077) 2 450 900.00\n"
+    "Inspection & Certification Fee for JAS for 2020 : 1 Day @ Euro 450/Day (Offer\n"
+    "Ref. No : CU/SL/2011/077) 1 450 450.00\n"
+    "JAS Communication Fee for 2020 (Offer Ref No:CUSL-ORG-2020-015-APR\n"
+    "133141) (Payable for Japanese Language Documentation in Japan) 1 60 60.00\n"
+    "EUR five thousand four hundred ten only Total : EUR 5,410.00\n"
+    "The LKR value of the SVAT amount is 99717.12 SVAT @ 8.00% 432.80\n"
+    "Exchange Rate: 1 EUR = 230.4000 LKR\n"
+    "Total value of the supply with SVAT EUR 5,842.80\n"
+)
+
+
+def _pripa_svat():
+    parsed = invoice_parser.parse_invoice(_PRIPA_SVAT_TEXT)
+    assert parsed.client == "PRIPA Organic Colombo (Private) Limited", parsed.client
+    assert len(parsed.descriptions) == 4, parsed.descriptions
+    assert parsed.descriptions[-1] == (
+        "JAS Communication Fee for 2020 (Offer Ref No:CUSL-ORG-2020-015-APR "
+        "133141) (Payable for Japanese Language Documentation in Japan)"
+    ), parsed.descriptions[-1]
+    assert parsed.total_amount == 5842.8, parsed.total_amount
+
+
+check("pripa svat: colombo company name + payable description kept", _pripa_svat)
+
+
+_SINDH_PUNJAB_TEXT = (
+    "Invoice\n"
+    "Sindh Punjab International Invoice ref:LKA/CUC/2026/06/1162\n"
+    "Main Road, Date :15-Jun-26\n"
+    "Dist. Khairpur\n"
+    "Sindh ,\n"
+    "Postal Code :\n"
+    "Pakistan\n"
+    "92-42-573228\n"
+    "sindhpunjab@hotmail.com\n"
+    "Description Quantity Rate Total\n"
+    "Import Certificate Charges - 01/02/2026-30/04/2026 1 60.00 € 60.00\n"
+)
+
+
+def _sindh_punjab():
+    parsed = invoice_parser.parse_invoice(_SINDH_PUNJAB_TEXT)
+    assert parsed.client == "Sindh Punjab International", parsed.client
+    assert parsed.descriptions == ["Import Certificate Charges - 01/02/2026-30/04/2026"], parsed.descriptions
+
+
+check("sindh punjab: 'Import ...' item line is not the client", _sindh_punjab)
+
+
+_SINDH_PUNJAB_VAT_TEXT = (
+    "Invoice\n"
+    "Sindh Punjab International Invoice ref:LKA/CUC/2026/06/1162\n"
+    "Main Road, Date :15-Jun-26\n"
+    "Dist. Khairpur\n"
+    "Sindh ,\n"
+    "Postal Code :\n"
+    "Pakistan\n"
+    "92-42-573228\n"
+    "sindhpunjab@hotmail.com\n"
+    "Reference Description of Goods or Services Quantity Unit Price Amount Excluding\n"
+    "VAT\n"
+    "Import Certificate Charges - 01/02/2026-30/04/2026 1 550.00 € 550.00 €\n"
+    "TC Charges - 01/02/2026-30/04/2026 1 315.00 € 315.00 €\n"
+    "COI Charges - 01/02/2026-30/04/2026 1 375.00 € 375.00 €\n"
+    "GBCOI Charges - 01/02/2026-30/04/2026 1 100.00 € 100.00 €\n"
+    "Total Value of Supply 1,340.00 €\n"
+    "VAT Amount (Total Value of Supply @ 18 % ) 241.20 €\n"
+    "Total Amount including VAT 1,581.20 €\n"
+    "Total Amount in words: One Thousand Five Hundred Eighty One Euro and Twenty Only\n"
+    "The LKR Value of the VAT amount is 92,449.55\n"
+    "Exchange Rate: 1 Euro = Rs 383.29/ €\n"
+)
+
+
+def _sindh_punjab_vat_totals():
+    parsed = invoice_parser.parse_invoice(_SINDH_PUNJAB_VAT_TEXT)
+    assert parsed.total_amount == 1581.2, parsed.total_amount
+    assert parsed.sub_total == 1340.0, parsed.sub_total
+    assert parsed.invoice_no == "LKA/CUC/2026/06/1162", parsed.invoice_no
+
+
+check("sindh punjab: words 'and Twenty Only' are cents, not +20", _sindh_punjab_vat_totals)
+
+
+def _noyon_lanka():
+    text = (
+        "SUSPENDED TAX INVOICE\n"
+        "NOYON LANKA (PVT) LTD Invoice ref: LKA/CUC/SVAT/2021/02/0740\n"
+        "#LOT 46A BIYAGAMA EPZ WALGMA, Project_ref: PRJ 871868\n"
+        "MALWANA Date: 11-02-2021\n"
+        "SRI LANKA\n"
+    )
+    assert invoice_parser.extract_invoice_number(text) == "LKA/CUC/SVAT/2021/02/0740"
+    assert invoice_parser.extract_client_name(text) == "NOYON LANKA (PVT) LTD"
+
+
+check("noyon: invoice heading never swallows company NO- prefix", _noyon_lanka)
+
+
 def _review2_amounts():
     assert invoice_parser._is_amount_token("2,000")
     assert not invoice_parser._is_amount_token("2000")
@@ -464,6 +578,40 @@ def _review2_invoice_no():
 
 
 check("review2: plain Invoice: label, bare one-segment refs, date guards", _review2_invoice_no)
+
+
+_TRRAX_TAX_INVOICE = (
+    "Tax Invoice\n"
+    "Date of Invoice: 7-Jul-26 Tax Invoice No. :26JUL_CCL1_0020\n"
+    "Supplier's TIN :114462322 Purchaser's TIN :114456772\n"
+    "Supplier's Name :Control Union Inspections (Pvt) Ltd Purchaser's Name :Serendipol (Private) Limited\n"
+    "Address :2nd Floor, BAM Musee Tower Address :Pannala Road, Dandagamuwa\n"
+    "52 Sir Marcus Fernando Mawatha, Colombo Kuliyapitiya\n"
+    "07 Telephone No.:\n"
+    "Telephone No.:0094112678607\n"
+    "Date of Supply :7-Jul-26 Place of Supply :\n"
+    "Additional Information if any: TerRax\n"
+    "Reference Description of Goods or Services Quantity Unit Price Amount\n"
+    "Excluding VAT\n"
+    "Invoice for TerRaX development fee for WhatsApp integration 1 110,000.00 110,000.00\n"
+    "Total Value of Supply 110,000.00\n"
+    "VAT Amount (Total Value of Supply @ 18 % ) 19,800.00\n"
+    "Total Amount including VAT 129,800.00\n"
+)
+
+
+def _terrax_tax_invoice():
+    parsed = invoice_parser.parse_invoice(_TRRAX_TAX_INVOICE)
+    assert parsed.client == "Serendipol (Private) Limited", parsed.client
+    assert parsed.invoice_no == "26JUL_CCL1_0020", parsed.invoice_no
+    assert parsed.descriptions == [
+        "Invoice for TerRaX development fee for WhatsApp integration"
+    ], parsed.descriptions
+    assert parsed.sub_total == 110000.0, parsed.sub_total
+    assert parsed.total_amount == 129800.0, parsed.total_amount
+
+
+check("terrax tax invoice: purchaser client, ref after date, supply subtotal", _terrax_tax_invoice)
 
 
 def _review2_net_amount():

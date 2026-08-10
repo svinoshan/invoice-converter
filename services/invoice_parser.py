@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import date
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from dateutil import parser as date_parser
 
@@ -302,13 +302,19 @@ def extract_invoice_date(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # "Invoice No: INV-123" (explicit label) or a plain "Invoice: 12345". The
-# plain-label alternative must stay on the same line (so a "TAX INVOICE"
-# heading can never capture the company name on the next line) and must
-# contain a digit ("No invoice here" is prose, not a reference).
-_INVOICE_NO_RE = re.compile(
-    r"(?:invoice\s*(?:ref(?:erence)?|no\.?|number|#)|inv\s*no\.?)\s*[:#]?\s*"
-    r"([A-Za-z0-9][A-Za-z0-9/\\\-._ ]{2,80})"
-    r"|\binvoice[ \t]*[:#]?[ \t]*(?=[^\n]*[0-9])([A-Za-z0-9][^\n]{1,39})",
+# label suffix ("No", "ref", ...) must stay on the same line as the word
+# "invoice" - a "\s*" would let the "INVOICE" heading swallow the "NO" of a
+# company on the next line ("TAX INVOICE\nNOYON LANKA ..." -> "YON LANKA").
+# The plain-label alternative must also stay on the same line (so a "TAX
+# INVOICE" heading can never capture the company name on the next line) and
+# must contain a digit ("No invoice here" is prose, not a reference).
+_INVOICE_NO_LABEL_RE = re.compile(
+    r"(?:invoice[ \t]*(?:ref(?:erence)?|no\.?|number|#)|inv[ \t]*no\.?)[ \t]*[:#]?[ \t]*"
+    r"([A-Za-z0-9][A-Za-z0-9/\\\-._ ]{2,80})",
+    re.IGNORECASE,
+)
+_INVOICE_NO_PLAIN_RE = re.compile(
+    r"\binvoice[ \t]*[:#]?[ \t]*(?=[^\n]*[0-9])([A-Za-z0-9][^\n]{1,39})",
     re.IGNORECASE,
 )
 # One slash/dash segment is enough ("INV-001", "INV/2026"), but the ref must
@@ -380,11 +386,23 @@ def extract_invoice_number(text: str) -> str:
     """Extract the invoice reference/number from ``text``."""
     if not text:
         return ""
-    match = _INVOICE_NO_RE.search(text)
-    if match:
-        cleaned = _clean_invoice_ref(match.group(1) or match.group(2))
+    # Explicit label first ("Invoice No. / Invoice Ref / Inv No"), then the
+    # plain "Invoice:" fallback - which runs only when no label exists at
+    # all, so "Invoice No: 26-04-2024" (a date) can never fall through to a
+    # bare "Invoice:" capture. The label scan walks every match so a
+    # leftmost date following "Date of Invoice: 7-Jul-26 Tax Invoice No.
+    # :26JUL_CCL1_0020" cannot shadow the real number further on.
+    label_found = False
+    for match in _INVOICE_NO_LABEL_RE.finditer(text):
+        label_found = True
+        cleaned = _clean_invoice_ref(match.group(1))
         if cleaned:
             return cleaned
+    if not label_found:
+        for match in _INVOICE_NO_PLAIN_RE.finditer(text):
+            cleaned = _clean_invoice_ref(match.group(1))
+            if cleaned and not _REF_DATE_RE.match(cleaned):
+                return cleaned
     match = _BARE_REF_RE.search(text)
     if match and not _REF_DATE_RE.match(match.group(1)):
         return match.group(1)
@@ -397,15 +415,24 @@ def extract_invoice_number(text: str) -> str:
 
 _CLIENT_LABEL_RE = re.compile(
     r"(?:client|customer|buyer|bill\s*to|consignee|sold\s*to|"
+    r"purchaser(?:'s)?\s*(?:name)?|"
     r"messrs\.?\s*|m\.?\s*[/.]\s*s\.?\s*)"
     r"\s*[:#.]?\s*([A-Za-z0-9][^\n]{2,80})",
     re.IGNORECASE,
 )
 _COMPANY_SUFFIX_RE = re.compile(
     r"\b(ltd\.?|limited|pvt\.?|private|co(?:rp)?\.?|corp\.?|corporation|inc\.?|"
-    r"llc|gmbh|b\.v\.?|plc|srl|llp|company|enterprises?|exports?|imports?|"
+    r"llc|gmbh|b\.v\.?|plc|srl|llp|company|enterprises?|"
     r"industries|group|holdings?|associates?|trading|mills?|textiles?|"
     r"garments?|foods?|knitting|sugar|pharma|chemicals?|engineering)\b",
+    re.IGNORECASE,
+)
+# Legal-entity suffixes are a strong company signal: an address token like
+# "colombo" in the company name ("PRIPA Organic Colombo (Private) Limited")
+# must not veto such a line.
+_STRONG_ENTITY_RE = re.compile(
+    r"\b(ltd\.?|limited|pvt\.?|private|co(?:rp)?\.?|corp\.?|corporation|"
+    r"inc\.?|llc|gmbh|plc|srl|llp)\b",
     re.IGNORECASE,
 )
 _IGNORED_PREFIXES = (
@@ -414,6 +441,7 @@ _IGNORED_PREFIXES = (
     "terms", "amount", "total", "qty", "quantity", "rate", "attn", "attention",
     "for", "vat", "tax", "bank", "swift", "a/c", "acct", "account",
     "bill to", "sold to", "customer", "client", "buyer", "consignee",
+    "additional information", "additional info",
 )
 
 
@@ -464,7 +492,12 @@ def _looks_like_company(line: str) -> bool:
         return False
     if not _COMPANY_SUFFIX_RE.search(line):
         return False
-    if _is_bank_or_payment_line(lower) or _is_address_line(lower):
+    if _is_bank_or_payment_line(lower):
+        return False
+    # An address line is never the client name - but a strong legal suffix
+    # ("PRIPA Organic Colombo (Private) Limited") wins over loose address
+    # tokens such as "colombo" that appear inside the company name.
+    if not _STRONG_ENTITY_RE.search(line) and _is_address_line(lower):
         return False
     return True
 
@@ -525,7 +558,7 @@ def extract_client_name(text: str) -> str:
 
     # The name often sits directly above the invoice reference block - or on
     # the same line just before it ("YARANA TEXTILE MILLS Invoice ref:...").
-    ref_match = _INVOICE_NO_RE.search(text)
+    ref_match = _INVOICE_NO_LABEL_RE.search(text)
     if ref_match:
         line_start = text.rfind("\n", 0, ref_match.start()) + 1
         same_line_prefix = _clean_label_value(text[line_start: ref_match.start()])
@@ -559,7 +592,8 @@ _EXCLUDED_DESC_FRAGMENTS = (
     "account no", "account number", "authorised signatory", "authorized signatory",
     "amount in words", "balance due", "due date", "terms and conditions",
     "e.&o.e", "e & oe", "e&oe", "grand total", "total amount", "total due",
-    "net amount", "amount payable", "payable", "less: advance", "advance paid",
+    "net amount", "amount payable", "payable :", "payable:", "payable amount",
+    "less: advance", "advance paid",
     "credited to our", "kindly credit", "cheque", "cheque no", "all remittances",
     "please transfer", "for the payment", "we request", "in settlement",
     "thank you", "yours faithfully", "yours sincerely", "best regards",
@@ -581,6 +615,7 @@ _SKIP_DESC_PREFIXES = (
     "a/c", "date :", "date:", "dated", "total", "sub total", "currency",
     "bill to", "ship to", "client", "customer", "attn", "balance", "no.",
     "no:", "no ", "exchange", "discount", "advance", "deposit", "tax",
+    "excluding", "excl.", "exclusive of", "extra",
 )
 
 
@@ -860,6 +895,7 @@ _SUBTOTAL_EXCLUDED = (
 
 _SUBTOTAL_PATTERNS = (
     (re.compile(r"\bsub\s*[- ]?total\b"), 10),  # Sub Total / Subtotal / Sub-total
+    (re.compile(r"\btotal\s+value\s+of\s+supply\b"), 9),  # pre-VAT supply value
     (re.compile(r"\bnet\s*total\b"), 8),
     (re.compile(r"\bnet\s*amount\b"), 8),
     (re.compile(r"\btotal\s*before\s*(?:tax|vat)\b"), 7),
@@ -908,6 +944,22 @@ def _words_to_number(text: str) -> Optional[float]:
     if fraction and int(fraction.group(2)) > 0:
         cents = round(int(fraction.group(1)) * 100 / int(fraction.group(2)))
         found = True
+
+    # "and Twenty Only" — SL/SVAT invoices write cents as small words after
+    # 'and' ("Eighty One Euro and Twenty Only" = 0.20, not +20). Only treat
+    # it as cents when every word is a small number (< 100) and 'only'
+    # follows, so "Five Hundred and Twenty Only" still means 520.
+    phrase_match = re.search(
+        r"\band\s+([a-z]+(?:\s+[a-z]+)?)\s+only\b", text.lower()
+    )
+    if phrase_match:
+        cents_words = phrase_match.group(1).split()
+        if cents_words and all(
+            w in _WORD_NUMBERS and _WORD_NUMBERS[w] < 100 for w in cents_words
+        ):
+            cents = _parse_small_number(cents_words)
+            text = text.lower().replace(phrase_match.group(0), "", 1)
+            words = re.findall(r"[a-z]+", text)
 
     # A spelled-out 'cents' phrase ("...and forty cents") must be parsed and
     # removed BEFORE the main loop - otherwise the same words are counted
@@ -980,8 +1032,13 @@ _TAX_RATE_LINE_RE = re.compile(
 
 def _total_candidate_amount(
     lines: List[str], index: int, label_end: int = 0
-) -> Optional[float]:
+) -> Optional[Tuple[float, bool]]:
     """Find the amount belonging to a total/subtotal label line.
+
+    Returns ``(amount, from_words)`` where ``from_words`` is True when the
+    value came from spelled-out words (e.g. "Total Amount in words: ...")
+    instead of a machine-typed numeric token - callers prefer numeric values
+    over words when labels tie.
 
     Looks at the label line first (spelled-out words, then the numeric amount
     that follows the label), then at up to two following lines (some invoices
@@ -1008,14 +1065,14 @@ def _total_candidate_amount(
             if offset == 0 and "/" not in lines[line_index]:
                 numeric = _first_numeric_from_line(lines[line_index][label_end:])
                 if numeric is not None and abs(numeric - amount) > 0.005:
-                    return numeric
-            return amount
+                    return (numeric, False)
+            return (amount, True)
         if offset == 0:
             amount = _first_numeric_from_line(lines[line_index][label_end:])
         else:
             amount = _extract_numeric_from_line(lines[line_index])
         if amount is not None:
-            return amount
+            return (amount, False)
     return None
 
 
@@ -1061,19 +1118,22 @@ def extract_sub_total(text: str) -> Optional[float]:
             kw in lower
             for kw in ("grand total", "invoice total", "total amount",
                        "total payable", "amount due", "amount owing",
-                       "balance due")
+                       "balance due", "vat amount", "tax amount")
         ):
             continue
         amount = _total_candidate_amount(lines, index, match[1])
         if amount is not None:
-            candidates.append((rank, index, amount))
+            candidates.append((rank, index, amount[0], amount[1]))
 
     if not candidates:
         return None
 
     best_rank = max(candidate[0] for candidate in candidates)
     best_candidates = [c for c in candidates if c[0] == best_rank]
-    chosen = max(best_candidates, key=lambda c: c[1])
+    # A machine-typed numeric beats a spelled-out duplicate ("Sub Total in
+    # words: ...") when both carry the same label.
+    numeric_candidates = [c for c in best_candidates if not c[3]]
+    chosen = max(numeric_candidates or best_candidates, key=lambda c: c[1])
     return round(chosen[2], 2)
 
 
@@ -1089,7 +1149,9 @@ def extract_total_amount(text: str) -> Optional[float]:
 
     Never returns a subtotal, tax or VAT figure - those lines are excluded
     before ranking. When several total-like values exist, the value with the
-    most explicit label and the latest position in the document wins. On
+    most explicit label wins; among equal labels a machine-typed numeric
+    amount is preferred over a spelled-out "in words" duplicate, and the
+    latest position in the document breaks ties. On
     SVAT / suspended-tax invoices the "Total value of the supply with SVAT"
     line is the final payable and outranks plain "Total" lines. Lines whose
     label says the tax is *included* ("Total (Including Tax)") are final
@@ -1117,14 +1179,17 @@ def extract_total_amount(text: str) -> Optional[float]:
             rank = max(rank, 11)
         amount = _total_candidate_amount(lines, index, match[1])
         if amount is not None:
-            candidates.append((rank, index, amount))
+            candidates.append((rank, index, amount[0], amount[1]))
 
     if not candidates:
         return None
 
     best_rank = max(candidate[0] for candidate in candidates)
     best_candidates = [c for c in candidates if c[0] == best_rank]
-    chosen = max(best_candidates, key=lambda c: c[1])
+    # A machine-typed numeric beats a spelled-out duplicate ("Total Amount in
+    # words: ...") when both carry the same label.
+    numeric_candidates = [c for c in best_candidates if not c[3]]
+    chosen = max(numeric_candidates or best_candidates, key=lambda c: c[1])
     return round(chosen[2], 2)
 
 

@@ -18,3 +18,4 @@ env/
 # Streamlit
 .streamlit/
 /docs
+.agents/skills/developing-with-streamlit
