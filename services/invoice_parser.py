@@ -159,7 +159,8 @@ _MONTH_NAME_DATE_RE = re.compile(
     r"^(\d{1,2})[-/.\s]?([A-Za-z]{3,9})[-/.\s]?(\d{2,4})$", re.IGNORECASE
 )
 _DATE_LABEL_RE = re.compile(
-    r"(?:invoice\s*)?(?:date|dated)\s*[:#]?\s*([A-Za-z0-9][^\n]{2,40}?)(?:\n|$)",
+    r"(?:invoice\s*)?(?:date|dated)(?:\s+of\s+(?:the\s+)?invoice)?\s*[:#]?\s*"
+    r"([A-Za-z0-9][^\n]{2,60})",
     re.IGNORECASE,
 )
 _DATE_FALLBACK_RE = re.compile(
@@ -483,12 +484,24 @@ def _is_address_line(lower: str) -> bool:
     )
 
 
+# Document title lines ("SUSPENDED TAX INVOICE", "PROFORMA INVOICE") are
+# never a client name.
+_DOCUMENT_TITLE_RE = re.compile(
+    r"^(?:(?:suspended|pro-?forma|commercial|credit|debit|original|duplicate|"
+    r"certified|interim|final|receipt|export|import|official|sample)\s+)*"
+    r"(?:tax\s*|vat\s*|svat\s*)?invoice$",
+    re.IGNORECASE,
+)
+
+
 def _looks_like_company(line: str) -> bool:
     line = line.strip()
     if not (3 <= len(line) <= 70):
         return False
     lower = line.lower()
     if lower.startswith(_IGNORED_PREFIXES):
+        return False
+    if _DOCUMENT_TITLE_RE.match(line):
         return False
     if not _COMPANY_SUFFIX_RE.search(line):
         return False
@@ -510,20 +523,25 @@ _ITEM_HEADER_WORDS = (
 
 
 def _looks_like_name(text: str) -> bool:
-    """Weak company check: 2+ alphabetic words, no pure-digit tokens, and
-    not a label/title line. Used as a last resort when the supplier name
-    has no legal suffix (e.g. "YARANA TEXTILE MILLS")."""
+    """Weak company check: 2+ alphabetic words (initials count - "A D
+    Printers"), no pure-digit tokens, and not a label/title line. Used as a
+    last resort when the supplier name has no legal suffix (e.g. "YARANA
+    TEXTILE MILLS")."""
     s = text.strip()
     if not (3 <= len(s) <= 50):
         return False
     words = s.split()
-    alpha_words = [w for w in words if re.search(r"[A-Za-z]{2,}", w)]
-    if len(alpha_words) < 2:
+    letter_words = [w for w in words if re.search(r"[A-Za-z]", w)]
+    if len(letter_words) < 2:
+        return False
+    if not any(re.search(r"[A-Za-z]{2,}", w) for w in letter_words):
         return False
     if any(w.replace(",", "").replace(".", "").isdigit() for w in words):
         return False
     lower = s.lower()
     if lower.startswith(_IGNORED_PREFIXES):
+        return False
+    if _DOCUMENT_TITLE_RE.match(s):
         return False
     if _is_bank_or_payment_line(lower) or _is_address_line(lower):
         return False
@@ -816,9 +834,28 @@ def extract_line_items(text: str, default_currency: str = "") -> List[InvoiceLin
             break
         item = _parse_item_line(raw_line, default_currency, table_mode=table_mode)
         if item is None:
-            if table_mode and _looks_like_item_text(raw_line):
-                pending.append(raw_line.strip())
-            continue
+            # A wrapped continuation that begins with a reference label
+            # ("No : CUSL/... 1 4,000 4,000.00") is vetoed on its own - but
+            # merged with the pending lines of an item in progress it is a
+            # real charge line, e.g. "(Offer Ref." + "No : CUSL/2015/03)".
+            if (
+                table_mode
+                and pending
+                and not _is_region_stop_line(raw_line)
+                and _numeric_amounts_from_line(raw_line)
+            ):
+                combined = _parse_item_line(
+                    " ".join(pending) + " " + raw_line.strip(),
+                    default_currency,
+                    table_mode=True,
+                )
+                if combined is not None:
+                    item = combined
+                    pending = []
+            if item is None:
+                if table_mode and _looks_like_item_text(raw_line):
+                    pending.append(raw_line.strip())
+                continue
         if pending:
             item.description = " ".join(pending) + " " + item.description
             pending = []

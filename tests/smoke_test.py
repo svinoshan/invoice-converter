@@ -276,6 +276,37 @@ def _tropical_wrapped_line():
 check("parser: wrapped item description joins continuation lines", _tropical_wrapped_line)
 
 
+_WRAPPED_NO_REF_TEXT = (
+    "Description Quantity Rate Total :\n"
+    "Inspection & Certification Fee for FM/COC for 2020 : @ 4000/Audit (Offer Ref.\n"
+    "No : CUSL/FSC_FMCOC/2015/03) 1 4,000 4,000.00\n"
+    "EUR four thousand only Total : EUR 4,000.00\n"
+    "The LKR value of the SVAT amount is 71721.60 SVAT @ 8.00% 320.00\n"
+    "Exchange Rate: 1 EUR = 224.1300 LKR\n"
+    "Total value of the supply with SVAT EUR 4,320.00\n"
+)
+
+
+def _wrapped_no_ref_continuation():
+    descs = invoice_parser.extract_descriptions(_WRAPPED_NO_REF_TEXT)
+    assert descs == [
+        "Inspection & Certification Fee for FM/COC for 2020 : @ 4000/Audit "
+        "(Offer Ref. No : CUSL/FSC_FMCOC/2015/03)"
+    ], descs
+    parsed = invoice_parser.parse_invoice(_WRAPPED_NO_REF_TEXT)
+    assert parsed.total_amount == 4320.0, parsed.total_amount
+    for standalone in (
+        "No : 1234\n",
+        "No Product 1 4,000 4,000.00\n",
+        "No: DEF/001 1 500.00\n",
+        "no refunds after 30 days 500.00\n",
+    ):
+        assert invoice_parser.extract_descriptions(standalone) == [], standalone
+
+
+check("parser: 'No : ref' continuation joins wrapped item, standalone No rows dropped", _wrapped_no_ref_continuation)
+
+
 _YARANA_TEXT = (
     "Invoice\n"
     "YARANA TEXTILE MILLS Invoice ref:LKA/CUC/2026/06/1237\n"
@@ -457,6 +488,22 @@ def _pripa_svat():
 check("pripa svat: colombo company name + payable description kept", _pripa_svat)
 
 
+_AD_PRINTERS_TEXT = (
+    "SUSPENDED TAX INVOICE\n"
+    "A D Printers Invoice ref: LKA/CUC/SVAT/2020/10/0421\n"
+    "Main Street, Colombo 02\n"
+)
+
+
+def _ad_printers():
+    parsed = invoice_parser.parse_invoice(_AD_PRINTERS_TEXT)
+    assert parsed.client == "A D Printers", parsed.client
+    assert parsed.invoice_no == "LKA/CUC/SVAT/2020/10/0421", parsed.invoice_no
+
+
+check("svat heading is not the client; initials name wins", _ad_printers)
+
+
 _SINDH_PUNJAB_TEXT = (
     "Invoice\n"
     "Sindh Punjab International Invoice ref:LKA/CUC/2026/06/1162\n"
@@ -604,6 +651,7 @@ def _terrax_tax_invoice():
     parsed = invoice_parser.parse_invoice(_TRRAX_TAX_INVOICE)
     assert parsed.client == "Serendipol (Private) Limited", parsed.client
     assert parsed.invoice_no == "26JUL_CCL1_0020", parsed.invoice_no
+    assert parsed.invoice_date == "7-Jul-26", parsed.invoice_date
     assert parsed.descriptions == [
         "Invoice for TerRaX development fee for WhatsApp integration"
     ], parsed.descriptions
@@ -612,6 +660,22 @@ def _terrax_tax_invoice():
 
 
 check("terrax tax invoice: purchaser client, ref after date, supply subtotal", _terrax_tax_invoice)
+
+
+_TRRAX_NUMERIC_DATE = (
+    "Tax Invoice\n"
+    "Date of Invoice: 07/24/2026 Tax Invoice No. :26JUL_CCL1_0125\n"
+    "Supplier's TIN :114462322 Purchaser's TIN :114742945\n"
+)
+
+
+def _terrax_numeric_date():
+    parsed = invoice_parser.parse_invoice(_TRRAX_NUMERIC_DATE)
+    assert parsed.invoice_date == "24-Jul-26", parsed.invoice_date
+    assert parsed.invoice_no == "26JUL_CCL1_0125", parsed.invoice_no
+
+
+check("terrax: numeric 'Date of Invoice' on a long line still parses", _terrax_numeric_date)
 
 
 def _review2_net_amount():
