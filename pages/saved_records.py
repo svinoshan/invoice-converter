@@ -7,6 +7,7 @@ on invoice_no, and the currently filtered set can be exported to Excel.
 
 from __future__ import annotations
 
+import time
 from datetime import date as date_type
 from typing import Dict, List
 
@@ -131,7 +132,9 @@ def render() -> None:
             export_records = (
                 editor_value.to_dict("records")
                 if isinstance(editor_value, pd.DataFrame)
-                else SS.saved_records
+                else [
+                    ui_helpers.record_to_row(rec) for rec in SS.saved_records
+                ]
             )
             st.download_button(
                 "Export to Excel",
@@ -151,63 +154,134 @@ def render() -> None:
 
     if not SS.saved_records:
         st.caption("No records match the current filters.")
+    else:
+        frame = pd.DataFrame([ui_helpers.record_to_row(r) for r in SS.saved_records])
+        frame["Reviewed"] = [bool(r.get("reviewed")) for r in SS.saved_records]
+
+        st.caption(
+            ":red[Unsaved changes]" if pending else ":green[All changes saved]"
+        )
+
+        edited = st.data_editor(
+            frame,
+            key="saved_editor",
+            width="stretch",
+            on_change=_mark_edited,
+            column_config={
+                "Invoice Date": st.column_config.TextColumn("Invoice Date"),
+                "Sub total": st.column_config.NumberColumn("Sub total", format="%.2f"),
+                "Total amount": st.column_config.NumberColumn("Total amount", format="%.2f"),
+                "Reviewed": st.column_config.CheckboxColumn("Reviewed"),
+            },
+        )
+
+        records = edited.to_dict("records")
+
+        if save_clicked:
+            _save_changes(records)
+
+        validation = validators.validate_rows(records)
+        if validation:
+            blocking = sum(
+                1
+                for item in validation
+                if any(
+                    issue.startswith(("Missing invoice number", "Total amount"))
+                    for issue in item["issues"]
+                )
+            )
+            st.warning(
+                f"{len(validation)} row(s) have issues "
+                f"({blocking} block saving). View the details below. Only a "
+                "missing invoice number or total amount blocks saving; other "
+                "issues (e.g. a missing invoice date) are advisory."
+            )
+            with st.expander("View issue details"):
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Row": item["row"],
+                                "Issues": ", ".join(item["issues"]),
+                            }
+                            for item in validation
+                        ]
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+
+    with st.expander("View duplicate files"):
+        _render_duplicate_cleanup()
+
+
+def _cached_duplicate_groups() -> List[Dict]:
+    """Duplicate source-file groups, refetched at most every 30s.
+
+    Session-state timestamp keeps the query cheap on every rerun while still
+    reflecting fresh duplicates; a delete resets the timestamp so the list
+    updates immediately.
+    """
+    SS = st.session_state
+    fetched_at = SS.get("saved_dups_at", 0.0)
+
+    if time.monotonic() - fetched_at > 30 or "saved_dups" not in SS:
+        SS.saved_dups = supabase_service.get_duplicate_groups()
+        SS.saved_dups_at = time.monotonic()
+    return SS.saved_dups
+
+
+def _render_duplicate_cleanup() -> None:
+    """List records sharing the same source PDF and let the user delete the
+    wrong invoice-number rows (two-step confirm, keyed by invoice_no)."""
+    SS = st.session_state
+    groups = _cached_duplicate_groups()
+    if not groups:
+        st.caption("No duplicate source files found.")
         return
 
-    frame = pd.DataFrame([ui_helpers.record_to_row(r) for r in SS.saved_records])
-    frame["Reviewed"] = [bool(r.get("reviewed")) for r in SS.saved_records]
-
-    st.caption(
-        ":red[Unsaved changes]" if pending else ":green[All changes saved]"
-    )
-
-    edited = st.data_editor(
-        frame,
-        key="saved_editor",
-        width="stretch",
-        on_change=_mark_edited,
-        column_config={
-            "Invoice Date": st.column_config.TextColumn("Invoice Date"),
-            "Sub total": st.column_config.NumberColumn("Sub total", format="%.2f"),
-            "Total amount": st.column_config.NumberColumn("Total amount", format="%.2f"),
-            "Reviewed": st.column_config.CheckboxColumn("Reviewed"),
-        },
-    )
-
-    records = edited.to_dict("records")
-
-    if save_clicked:
-        _save_changes(records)
-
-    validation = validators.validate_rows(records)
-    if validation:
-        blocking = sum(
-            1
-            for item in validation
-            if any(
-                issue.startswith(("Missing invoice number", "Total amount"))
-                for issue in item["issues"]
+    for group in groups:
+        with st.container(border=True):
+            st.caption(
+                f":orange[{len(group['records'])} rows] - {group['source_file']}"
             )
-        )
-        st.warning(
-            f"{len(validation)} row(s) have issues "
-            f"({blocking} block saving). View the details below. Only a "
-            "missing invoice number or total amount blocks saving; other "
-            "issues (e.g. a missing invoice date) are advisory."
-        )
-        with st.expander("View issue details"):
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Row": item["row"],
-                            "Issues": ", ".join(item["issues"]),
-                        }
-                        for item in validation
-                    ]
-                ),
-                hide_index=True,
-                width="stretch",
-            )
+            for rec in group["records"]:
+                invoice_no = str(rec.get("invoice_no") or "").strip()
+                c1, c2, c3, c4, c5 = st.columns([3, 1.5, 2.5, 1, 1])
+                if not invoice_no:
+                    c1.caption("(no invoice no - delete cannot be addressed)")
+                    continue
+                c1.caption(invoice_no)
+                c2.caption(str(rec.get("invoice_date") or ""))
+                c3.caption(str(rec.get("client") or ""))
+                c4.caption(":green[Reviewed]" if rec.get("reviewed") else "")
+                confirm_key = f"del_confirm_{invoice_no}"
+                if SS.get(confirm_key):
+                    with c5.container():
+                        st.caption("Delete?")
+                        yes_col, no_col = st.columns(2)
+                        if yes_col.button("Yes", key=f"del_yes_{invoice_no}"):
+                            try:
+                                deleted = supabase_service.delete_invoice_record(
+                                    invoice_no
+                                )
+                            except Exception as exc:  # noqa: BLE001 - show to user
+                                deleted = False
+                                st.error(f"Delete failed: {exc}")
+                            if deleted:
+                                SS.saved_dups_at = 0.0
+                                ui_helpers.bump_revision()
+                                # Force the table above to refetch so the
+                                # deleted row disappears from the filters too.
+                                SS.saved_loaded = False
+                                st.success(f"Deleted record {invoice_no}")
+                            else:
+                                st.error(f"Record {invoice_no} was not found.")
+                            SS[confirm_key] = False
+                        if no_col.button("No", key=f"del_no_{invoice_no}"):
+                            SS[confirm_key] = False
+                elif c5.button("Delete", key=f"del_{invoice_no}"):
+                    SS[confirm_key] = True
 
 
 def _save_changes(records: List[Dict]) -> None:

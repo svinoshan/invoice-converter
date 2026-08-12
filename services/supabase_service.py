@@ -235,6 +235,65 @@ def update_reviewed_status(invoice_no: str, reviewed: bool) -> bool:
         raise _friendly_error(exc) from exc
 
 
+def delete_invoice_record(invoice_no: str) -> bool:
+    """Delete the stored record identified by ``invoice_no``.
+
+    ``invoice_no`` is the table's upsert key, so it uniquely addresses one
+    row; an empty value never deletes anything.
+    """
+    invoice_no = (invoice_no or "").strip()
+    if not invoice_no:
+        return False
+    try:
+        response = (
+            _get_client()
+            .table(_INVOICE_RECORDS_TABLE)
+            .delete()
+            .eq("invoice_no", invoice_no)
+            .execute()
+        )
+        return bool(response.data)
+    except Exception as exc:
+        logger.error("delete_invoice_record failed for %s: %s", invoice_no, exc)
+        raise _friendly_error(exc) from exc
+
+
+def get_duplicate_groups(limit: int = 10000) -> List[Dict[str, Any]]:
+    """Return groups of records sharing the same source PDF file (>1 rows).
+
+    Duplicates appear when the same PDF was processed more than once and the
+    extracted invoice number differed between runs (e.g. after a parser fix):
+    because ``invoice_no`` is the upsert key, the wrong-number row is never
+    overwritten. Grouping rows by ``source_file_name`` surfaces those groups
+    so a user can keep the correct invoice number and delete the rest. Only
+    display columns are fetched - never ``raw_text``.
+    """
+    try:
+        query = (
+            _get_client()
+            .table(_INVOICE_RECORDS_TABLE)
+            .select(
+                "invoice_no, invoice_date, client, reviewed, "
+                "extraction_status, total_amount, source_file_name"
+            )
+        )
+        records = _fetch_paginated(query, limit=limit, order="invoice_date")
+    except Exception as exc:
+        logger.error("get_duplicate_groups failed: %s - %s", _friendly_error(exc), exc)
+        return []
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records:
+        name = (rec.get("source_file_name") or "").strip()
+        if not name:
+            continue
+        by_file.setdefault(name, []).append(rec)
+    return [
+        {"source_file": name, "records": recs}
+        for name, recs in sorted(by_file.items(), key=lambda item: item[0].lower())
+        if len(recs) > 1
+    ]
+
+
 def get_all_invoice_records(
     limit: int = 10000, order: str = "invoice_date"
 ) -> List[Dict[str, Any]]:

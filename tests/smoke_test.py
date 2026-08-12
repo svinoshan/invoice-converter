@@ -956,6 +956,7 @@ class _FakeQuery:
 
     def eq(self, column, value):
         self.filters.append(("eq", column, value))
+        self.state.setdefault("filters", []).append(("eq", column, value))
         return self
 
     def ilike(self, column, value):
@@ -987,6 +988,10 @@ class _FakeQuery:
         self.state["update"] = payload
         return self
 
+    def delete(self):
+        self.state["delete"] = True
+        return self
+
     def execute(self):
         return _FakeResponse(
             self.state.get("fake_data", []), self.state.get("fake_count")
@@ -1005,6 +1010,9 @@ class _FakeTable:
         q.state["upsert"] = payload
         q.state["on_conflict"] = on_conflict
         return q
+
+    def delete(self):
+        return _FakeQuery(self.state).delete()
 
 
 class _FakeClient:
@@ -1040,6 +1048,42 @@ def _sb_upsert():
 
 
 check("supabase: upsert on invoice_no conflict", _sb_upsert)
+
+
+def _sb_delete():
+    client = _install_fake_client()
+    client.state["fake_data"] = [{"invoice_no": "INV-1"}]
+    ok = supabase_service.delete_invoice_record("INV-1")
+    assert ok is True
+    assert client.state["delete"] is True
+    assert ("eq", "invoice_no", "INV-1") in client.state["filters"]
+    assert supabase_service.delete_invoice_record("  ") is False
+
+
+check("supabase: delete_invoice_record filters by invoice_no", _sb_delete)
+
+
+def _sb_duplicate_groups():
+    client = _install_fake_client()
+    client.state["fake_data"] = [
+        {"invoice_no": "X1", "invoice_date": "2026-06-08",
+         "source_file_name": "a.pdf", "client": "M", "reviewed": False},
+        {"invoice_no": "X2", "invoice_date": "2026-06-09",
+         "source_file_name": "a.pdf", "client": "M", "reviewed": False},
+        {"invoice_no": "X3", "invoice_date": "2026-06-10",
+         "source_file_name": "b.pdf", "client": "N", "reviewed": True},
+        {"invoice_no": "X4", "invoice_date": "2026-06-11",
+         "source_file_name": "", "client": "O", "reviewed": False},
+    ]
+    groups = supabase_service.get_duplicate_groups()
+    assert len(groups) == 1, groups
+    assert groups[0]["source_file"] == "a.pdf"
+    assert [r["invoice_no"] for r in groups[0]["records"]] == ["X1", "X2"]
+    select_args = " ".join(client.state.get("select_args") or ())
+    assert "raw_text" not in select_args, select_args
+
+
+check("supabase: get_duplicate_groups groups by source file only", _sb_duplicate_groups)
 
 
 def _sb_upsert_preserves_review():

@@ -125,6 +125,10 @@ class _FakeClient:
                  "description": "d2", "sub_total": 53.1, "total_amount": 53.1,
                  "currency": "USD", "extraction_status": "needs_review",
                  "reviewed": False, "source_file_name": "b.pdf"},
+                {"client": "M", "invoice_no": "I-3", "invoice_date": "2026-06-10",
+                 "description": "d3", "sub_total": 1345.2, "total_amount": 1345.2,
+                 "currency": "Euro", "extraction_status": "processed",
+                 "reviewed": False, "source_file_name": "a.pdf"},
             ]
         }
 
@@ -140,6 +144,9 @@ class _FakeTable:
     def select(self, *args, **kwargs):
         return _FakeQuery(self.state).select(*args, **kwargs)
 
+    def delete(self):
+        return _FakeQuery(self.state).delete()
+
 
 class _FakeQuery:
     def __init__(self, state):
@@ -153,6 +160,7 @@ class _FakeQuery:
     def order(self, *a, **k): return self
     def limit(self, *a): return self
     def range(self, *a): return self
+    def delete(self): return self
 
     def execute(self):
         return type("R", (), {"data": self.state["fake_data"], "count": None})()
@@ -169,6 +177,19 @@ assert (
     at.get("bar_chart") or at.get("arrow_vega_lite_chart") or at.get("vega_lite_chart")
 ), "no bar chart"
 assert at.dataframe, "no currency table"
+
+# Saved Records with seeded data: the duplicate-cleanup expander lists the
+# two rows sharing a.pdf and offers a Delete button per row.
+at.switch_page("pages/saved_records.py")
+at.run()
+assert not at.exception, [str(e) for e in at.exception]
+buttons = [b.label for b in at.get("button")]
+print("saved_records seeded buttons:", buttons)
+assert "Delete" in buttons, buttons
+assert "No duplicate source files found." not in [
+    c.value for c in at.get("caption")
+], "seeded duplicate group must be listed"
+assert "I-1" in [c.value for c in at.get("caption")], "duplicate invoice no shown"
 
 print("FAILS:", fails) if fails else print("all apptest checks passed")
 sys.exit(1 if fails else 0)
