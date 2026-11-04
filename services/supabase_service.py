@@ -26,7 +26,7 @@ from utils.logging_config import get_logger
 
 logger = get_logger("supabase_service")
 
-_INVOICE_RECORDS_TABLE = "invoice_records_duplicate"
+_INVOICE_RECORDS_TABLE = "invoice_records_organic"
 
 
 class SupabaseNotConfiguredError(RuntimeError):
